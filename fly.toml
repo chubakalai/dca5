@@ -1,12 +1,16 @@
-# fly.toml app configuration file generated for dca5 on 2026-07-28T09:12:20Z
+# fly.toml app configuration file generated for dca5 on 2026-07-31T11:43:37Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
 app = 'dca5'
-primary_region = 'iod'
+primary_region = 'ams'
 
 [build]
+
+[[mounts]]
+  source = 'dca5_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
@@ -15,10 +19,6 @@ primary_region = 'iod'
   auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
-
-[[mounts]]
-  source = 'dca5_data'
-  destination = '/data'
 
 [[vm]]
   memory = '1gb'
