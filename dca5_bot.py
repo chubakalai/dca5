@@ -145,7 +145,7 @@ ROLL_DAYS = 9   # trailing window for the 9-day-high price target, including tod
 # ── DCA schedule ───────────────────────────────────────────────────────────────
 # Each symbol gets its own $2000 budget split evenly across DCA_DAYS
 # daily fires. Aug 1 2026 -> Oct 29 2026 inclusive is 90 UTC calendar days.
-DCA_BUDGET_USD = 2000.0
+DCA_BUDGET_USD = 1000.0
 DCA_DAYS       = 90
 DCA_DAILY_USD  = DCA_BUDGET_USD / DCA_DAYS  # ~22.22
 
