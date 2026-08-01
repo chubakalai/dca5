@@ -139,7 +139,7 @@ MEXC_BASE   = "https://api.mexc.co"
 # EVERY one of these, not just one.
 SYMBOLS = ["SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT"]
 
-LEVERAGE  = 10
+LEVERAGE  = 30
 ROLL_DAYS = 9   # trailing window for the 9-day-high price target, including today
 
 # ── DCA schedule ───────────────────────────────────────────────────────────────
