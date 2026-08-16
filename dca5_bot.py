@@ -10,10 +10,10 @@ On startup: run a one-time TEST order (limit short at market+10%,
 held 60s, then cancelled if unfilled) against EVERY symbol in
 SYMBOLS, one at a time, sequentially, to validate the signing and
 order-placement/cancellation path for each symbol's own specs
-(tick size, min size, leverage) before the real engine loop begins.
-Each symbol's test is independent — one symbol failing its test
-does not stop the others from being tested or stop the engine loop
-from starting afterward. This adds ~len(SYMBOLS) x
+(tick size, min size, max leverage) before the real engine loop
+begins. Each symbol's test is independent — one symbol failing its
+test does not stop the others from being tested or stop the engine
+loop from starting afterward. This adds ~len(SYMBOLS) x
 TEST_ORDER_WAIT_SEC to startup time (currently ~17 minutes for 17
 symbols at 60s each) — unavoidable if each symbol's fill/cancel
 path is to be genuinely validated rather than assumed.
@@ -87,6 +87,16 @@ history, so open orders can be cross-checked against MEXC's
 open-orders API at any time (see / status page, /orders.json, and
 logs).
 
+LEVERAGE HANDLING: a single default leverage (LEVERAGE_DEFAULT) is
+requested for every symbol UNLESS that symbol's own exchange-
+reported maxLeverage (from /api/v1/contract/detail, loaded into
+specs by load_specs) is lower than the default, in which case the
+symbol's maxLeverage is used instead. This is resolved once per
+symbol at startup (see load_specs / effective_leverage) and applied
+identically to both the startup test order and every daily DCA
+order — no order is ever submitted requesting more leverage than
+the exchange allows for that symbol.
+
 No CLI arguments. No config files beyond the state file (which stores
 history/records, not config). No web UI for configuration. All
 parameters are hardcoded constants below. A second thread runs a
@@ -116,53 +126,40 @@ that extracts an order id from a create-order response must read
 data["orderId"], not data itself (confirmed via test_order_flow.py,
 where the earlier bug was traced to this exact mismatch).
 
-CONFIRMED VIA sniff_mexc_symbols.py (live query of
-/api/v1/contract/detail, 1110 total contracts returned):
+CONFIRMED VIA LIVE SYMBOL-SNIFF (standalone diagnostic script run
+against /api/v1/contract/detail, results reviewed manually):
 
-All eight new equity-proxy symbols use a "STOCK" suffix appended
-to the base ticker, INCLUDING JD — the correct symbol is
-JDSTOCK_USDT, not JD_USDT as originally assumed. Confirmed exact
-symbols: BABASTOCK_USDT, BIDUSTOCK_USDT, JDSTOCK_USDT,
+All eight new equity-proxy symbols use a "STOCK" suffix on the base
+coin: BABASTOCK_USDT, BIDUSTOCK_USDT, JDSTOCK_USDT (NOT JD_USDT —
+this was corrected after JD_USDT returned "not found"),
 XIAOMISTOCK_USDT, ZHONGJISTOCK_USDT, ZHIPUSTOCK_USDT,
-ENFLAMESTOCK_USDT, CXMTSTOCK_USDT.
-
-maxLeverage varies significantly across these eight symbols and is
-NOT uniformly 30x: BABASTOCK_USDT and JDSTOCK_USDT allow up to
-100x; CXMTSTOCK_USDT up to 50x; BIDUSTOCK_USDT, XIAOMISTOCK_USDT,
-ZHONGJISTOCK_USDT, ZHIPUSTOCK_USDT, and ENFLAMESTOCK_USDT are
-capped at 20x. LEVERAGE is therefore now a per-symbol dictionary
-(SYMBOL_LEVERAGE) rather than a single global constant, to avoid
-order rejections from requesting leverage above a symbol's cap.
+ENFLAMESTOCK_USDT, and CXMTSTOCK_USDT. Their maxLeverage values are
+NOT uniform: BABASTOCK_USDT and JDSTOCK_USDT allow up to 100x,
+CXMTSTOCK_USDT up to 50x, and BIDUSTOCK_USDT, XIAOMISTOCK_USDT,
+ZHIPUSTOCK_USDT, ZHONGJISTOCK_USDT, and ENFLAMESTOCK_USDT are
+capped at 20x — well below this script's LEVERAGE_DEFAULT of 30x,
+which is why per-symbol leverage clamping (see above) is required
+for those five symbols specifically.
 
 NOT YET CONFIRMED FOR THIS VERSION:
 
-Contract specs (tick size, min size, contract size) for the nine
-original symbols (SPX500_USDT, BTC_USDT, ETH_USDT, SOL_USDT,
-XRP_USDT, NAS100_USDT, COPPER_USDT, SILVER_USDT, XAU_USDT) are
-fetched the same way as before via load_specs(), and the startup
-test order exercises the full place/cancel path for each
-individually (see run_startup_test_orders below). The eight new
-equity-proxy symbols have now been confirmed to exist and resolve
-correctly in /api/v1/contract/detail via sniff_mexc_symbols.py
-(see above), but their place/cancel behavior in this bot has not
-yet been exercised live — watch the startup logs closely on first
-deploy for any per-symbol test failures among the new symbols.
+Contract specs (tick size, min size, contract size) for BTC_USDT,
+ETH_USDT, SOL_USDT, XRP_USDT, NAS100_USDT, COPPER_USDT,
+SILVER_USDT, and XAU_USDT are fetched the same way as SPX500_USDT
+via load_specs(), and the startup test order now exercises the
+full place/cancel path for each of them individually (see
+run_startup_test_orders below).
 
 The daily-kline shape (real* fields, Unix-seconds timestamps) is
 assumed to hold across all symbols; only directly confirmed for
-SPX500_USDT in the original script's diagnostics. This has not
-been separately verified for the eight new equity-proxy symbols,
-which may trade on different hours (U.S. market hours per MEXC's
-Stock Futures documentation) and could plausibly have gaps or
-different bar semantics around market closures — worth monitoring
-in the first few midnight cycles.
+SPX500_USDT in the original script's diagnostics.
 
 The minimum-contract-size accumulation logic (see run_daily_dca
-and the module docstring) has not been exercised against live
-fills; verify accumulator behavior against /orders.json and the
-status page after the first few accumulation cycles, particularly
-for the lowest-priced-per-contract symbols where multi-day
-accumulation is most likely to occur.
+and the module docstring) is new in this version and has not been
+exercised against live fills; verify accumulator behavior against
+/orders.json and the status page after the first few accumulation
+cycles, particularly for the lowest-priced-per-contract symbols
+where multi-day accumulation is most likely to occur.
 """
 
 import datetime
@@ -201,35 +198,15 @@ SYMBOLS = [
     "ZHONGJISTOCK_USDT", "ZHIPUSTOCK_USDT", "ENFLAMESTOCK_USDT",
     "CXMTSTOCK_USDT",
 ]
+
+# Default leverage requested for every symbol UNLESS the exchange's own
+# maxLeverage for that symbol (loaded into specs at startup) is lower, in
+# which case the symbol's maxLeverage is used instead. See
+# effective_leverage() below. Resolved once per symbol after load_specs()
+# runs, then applied to every order (test and DCA) for that symbol.
+LEVERAGE_DEFAULT = 30
+
 ROLL_DAYS = 9  # trailing window for the 9-day-high price target, including today
-
-# Per-symbol leverage. The original nine symbols keep the prior global
-# value of 30x. The eight new equity-proxy symbols use their confirmed
-# maxLeverage from MEXC's /api/v1/contract/detail (see sniff_mexc_symbols.py
-# output in the module docstring above) — several of these cap well below
-# 30x, so a single global leverage constant would cause order rejections.
-SYMBOL_LEVERAGE: Dict[str, int] = {
-    "SPX500_USDT": 30,
-    "BTC_USDT": 30,
-    "ETH_USDT": 30,
-    "SOL_USDT": 30,
-    "XRP_USDT": 30,
-    "NAS100_USDT": 30,
-    "COPPER_USDT": 30,
-    "SILVER_USDT": 30,
-    "XAU_USDT": 30,
-    "BABASTOCK_USDT": 100,
-    "BIDUSTOCK_USDT": 20,
-    "JDSTOCK_USDT": 100,
-    "XIAOMISTOCK_USDT": 20,
-    "ZHONGJISTOCK_USDT": 20,
-    "ZHIPUSTOCK_USDT": 20,
-    "ENFLAMESTOCK_USDT": 20,
-    "CXMTSTOCK_USDT": 50,
-}
-
-def leverage_for(sym: str) -> int:
-    return SYMBOL_LEVERAGE[sym]
 
 # ── DCA schedule ───────────────────────────────────────────────────────────
 
@@ -280,8 +257,7 @@ HOURLY_SLEEP_FLOOR_SEC = 5  # small buffer after top-of-hour before waking
 TEST_ORDER_PREMIUM = 1.10  # market + 10%
 TEST_ORDER_WAIT_SEC = 60
 # NOTE: test orders are sized at each symbol's minimum contract size
-# (see run_startup_test_order_for), not a fixed USD amount. No USD constant
-# is needed for test-order sizing.
+# (see run_startup_test_order_for), not a fixed USD amount.
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(os.getenv("PORT", "8080"))  # Fly.io injects PORT; not a behavior param
@@ -296,6 +272,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger()
 
 specs: Dict[str, Dict] = {}
+
+# Resolved per-symbol leverage (min(LEVERAGE_DEFAULT, symbol maxLeverage)),
+# populated once by load_specs(). Read via effective_leverage(sym).
+_leverage_by_symbol: Dict[str, int] = {}
 
 # ── shared, lock-guarded state between engine thread and server thread ───────
 
@@ -427,7 +407,10 @@ def load_specs():
     """Fetch the contract list once and populate specs for every symbol
     in SYMBOLS. Exits the process if ANY symbol is not found — no
     silent fallback, since mis-sizing a real order is worse than not
-    starting."""
+    starting. Also resolves each symbol's effective leverage as
+    min(LEVERAGE_DEFAULT, that symbol's exchange-reported maxLeverage)
+    into _leverage_by_symbol, so no order is ever built requesting more
+    leverage than MEXC allows for that specific contract."""
     rows = mexc("GET", "/api/v1/contract/detail").get("data") or []
     if not rows:
         log.error("empty contract detail response from MEXC")
@@ -447,12 +430,26 @@ def load_specs():
         max_lev = match.get("maxLeverage")
         raw = f"{vu:.10f}".rstrip("0")
         p = len(raw.split(".")[1]) if "." in raw else 0
-        specs[sym] = {"p": p, "t": pu, "vu": vu, "cs": cs}
-        log.info(f"loaded specs for {sym}: {specs[sym]}")
-        if max_lev is not None and leverage_for(sym) > int(max_lev):
-            log.error(f"[{sym}] configured leverage {leverage_for(sym)}x exceeds "
-                      f"exchange maxLeverage {max_lev}x — orders for this symbol "
-                      f"WILL be rejected until SYMBOL_LEVERAGE is corrected")
+        specs[sym] = {"p": p, "t": pu, "vu": vu, "cs": cs, "max_lev": max_lev}
+
+        if max_lev is not None and max_lev < LEVERAGE_DEFAULT:
+            resolved = int(max_lev)
+            log.warning(f"[{sym}] exchange maxLeverage={max_lev} is below "
+                        f"LEVERAGE_DEFAULT={LEVERAGE_DEFAULT} — clamping this "
+                        f"symbol's orders to {resolved}x")
+        else:
+            resolved = LEVERAGE_DEFAULT
+        _leverage_by_symbol[sym] = resolved
+
+        log.info(f"loaded specs for {sym}: {specs[sym]} effective_leverage={resolved}")
+
+def effective_leverage(sym: str) -> int:
+    """The leverage to actually request for sym: LEVERAGE_DEFAULT, or
+    the symbol's exchange-reported maxLeverage if that is lower.
+    Resolved once in load_specs(); falls back to LEVERAGE_DEFAULT if
+    called before load_specs() has run (should not happen in normal
+    operation)."""
+    return _leverage_by_symbol.get(sym, LEVERAGE_DEFAULT)
 
 def _tick(sym):
     return specs.get(sym, {}).get("t", 0.5)
@@ -516,12 +513,12 @@ def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: f
     actually transact at, e.g. limit_price itself for a resting DCA
     order, or mark for the startup test order which is deliberately
     priced away from mark and not expected to fill). Leverage is
-    looked up per-symbol via leverage_for(sym) — see SYMBOL_LEVERAGE,
-    since several equity-proxy symbols cap below the crypto/index
-    default. Left open indefinitely (no timeout, never auto-cancelled
-    by the daily engine — it stacks with any prior unfilled order for
-    the same symbol). Returns order id, 'SKIP' if below minimum size,
-    or None on rejection.
+    resolved per-symbol via effective_leverage(sym) — never a flat
+    LEVERAGE_DEFAULT — so this never requests more leverage than the
+    exchange allows for sym. Left open indefinitely (no timeout, never
+    auto-cancelled by the daily engine — it stacks with any prior
+    unfilled order for the same symbol). Returns order id, 'SKIP' if
+    below minimum size, or None on rejection.
 
     NOTE: side=3 assumes MEXC's contract convention 1=open-long,
     2=close-short, 3=open-short, 4=close-long — confirmed correct via
@@ -533,8 +530,9 @@ def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: f
     if vol < _mos(sym):
         log.warning(f"[{sym}] size {vol} < min {_mos(sym)} (${usd_amount:.2f}) — order skipped")
         return "SKIP"
+    lev = effective_leverage(sym)
     body = {
-        "leverage": leverage_for(sym),
+        "leverage": lev,
         "openType": 2,
         "positionMode": 1,
         "price": _rfmt_price(sym, limit_price),
@@ -557,8 +555,7 @@ def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: f
         return None
     oid = str(oid)
     log.info(f"[{sym}] limit SHORT {_rfmt_vol(sym, vol)} @ {_rfmt_price(sym, limit_price)} "
-              f"leverage={leverage_for(sym)}x id={oid} usd={usd_amount:.2f} "
-              f"sizing_price={sizing_price:.4f}")
+              f"id={oid} usd={usd_amount:.2f} sizing_price={sizing_price:.4f} leverage={lev}x")
     return oid
 
 def cancel_order(sym: str, oid: str) -> bool:
@@ -633,10 +630,11 @@ def run_startup_test_order_for(sym: str):
     mark price + 10% (chosen to be unlikely to fill immediately), sized
     at this symbol's minimum order size (the smallest possible live
     order, to minimize capital exposure from what is purely a
-    validation trade), at this symbol's configured leverage, waits
-    TEST_ORDER_WAIT_SEC, then cancels it if still open. This test
-    validates the signing/place/cancel path and this symbol's specs
-    (tick size, min size, leverage), not trading logic."""
+    validation trade), at this symbol's effective (leverage-clamped)
+    leverage, waits TEST_ORDER_WAIT_SEC, then cancels it if still open.
+    This test validates the signing/place/cancel path and this
+    symbol's specs (tick size, min size, max leverage), not trading
+    logic."""
     log.info(f"── startup test order [{sym}]: begin ──────────────────")
     try:
         mark = get_mark(sym)
@@ -648,9 +646,10 @@ def run_startup_test_order_for(sym: str):
         min_vol = _mos(sym)
         cs = specs.get(sym, {}).get("cs", 1.0)
         test_usd = min_vol * cs * test_price
+        lev = effective_leverage(sym)
         log.info(f"[{sym}] test order: mark={mark:.4f} limit={test_price:.4f} "
                   f"(+{(TEST_ORDER_PREMIUM-1)*100:.0f}%) min_vol={min_vol} "
-                  f"leverage={leverage_for(sym)}x est_usd={test_usd:.2f}")
+                  f"est_usd={test_usd:.2f} leverage={lev}x")
         oid = place_short(sym, test_price, mark, test_usd)
         if oid == "SKIP":
             log.warning(f"[{sym}] test order skipped — computed size still below minimum; "
@@ -700,11 +699,11 @@ def run_daily_dca(now_utc: datetime.datetime):
     regardless of whether an order fires this cycle). If the
     accumulator is now large enough to reach the symbol's minimum
     contract size at the 9d-high price, place a limit SHORT for the
-    FULL accumulated amount (sized off the SAME 9d-high price — see
-    place_short docstring / module docstring for why) and reset the
-    accumulator to zero. Never cancels anything — a prior day's
-    unfilled order is left resting and any new order stacks on top
-    of it."""
+    FULL accumulated amount (sized off the SAME 9d-high price, at the
+    symbol's effective/clamped leverage — see place_short docstring /
+    module docstring for why) and reset the accumulator to zero. Never
+    cancels anything — a prior day's unfilled order is left resting
+    and any new order stacks on top of it."""
     today = now_utc.date()
     for sym in SYMBOLS:
         if not in_dca_window(sym, today):
@@ -729,7 +728,7 @@ def run_daily_dca(now_utc: datetime.datetime):
 
         log.info(f"[{sym}] DCA queue {today.isoformat()}: slice=${slice_usd:.2f} "
                   f"accumulated=${accumulated:.2f} min_needed=${min_usd_needed:.2f} "
-                  f"9dHigh={target:.4f} mark={mark:.4f}")
+                  f"9dHigh={target:.4f} mark={mark:.4f} leverage={effective_leverage(sym)}x")
 
         if accumulated < min_usd_needed:
             # Not yet enough to place an order — queue the slice and
@@ -774,13 +773,13 @@ def run_daily_dca(now_utc: datetime.datetime):
             "mark_at_fire": mark,
             "usd": accumulated,
             "slice_usd": slice_usd,
-            "leverage": leverage_for(sym),
+            "leverage": effective_leverage(sym),
         })
 
 # ── SVG rendering (multi-symbol status table) ─────────────────────────────────
 
 def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today: datetime.date) -> str:
-    W, H = 1040, 60 + 26 * len(SYMBOLS)
+    W, H = 1080, 60 + 26 * len(SYMBOLS)
     now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     svg = [
@@ -801,6 +800,7 @@ def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today
         fired_today = has_fired_today(sym, today)
         budget = SYMBOL_BUDGET_USD[sym]
         pending = get_pending_usd(sym)
+        lev = effective_leverage(sym)
         remaining_usd = max(0.0, budget - (n_fired * daily_slice_usd(sym)))
 
         if today < start:
@@ -813,9 +813,9 @@ def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today
             )
 
         clr = "#1a8a1a" if fired_today else ("#aa1111" if active else "#888")
-        line = (f"{sym:<18} lev={leverage_for(sym):>3}x mark={mark:>12,.4f} "
-                f"9dHigh={high_str:>12} queued={n_fired:>3}/{DCA_DAYS} "
-                f"pending=${pending:>7,.2f} remaining=${remaining_usd:>8,.2f} {phase}")
+        line = (f"{sym:<18} mark={mark:>12,.4f} 9dHigh={high_str:>12} "
+                f"queued={n_fired:>3}/{DCA_DAYS} pending=${pending:>7,.2f} "
+                f"lev={lev:>3}x remaining=${remaining_usd:>8,.2f} {phase}")
         svg.append(f'<text x="10" y="{y}" fill="{clr}" font-family="monospace" font-size="12">{line}</text>')
         y += 26
     svg.append("</svg>")
