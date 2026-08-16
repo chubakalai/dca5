@@ -137,8 +137,8 @@ MEXC_BASE   = "https://api.mexc.co"
 
 # Symbols in this DCA program. The startup test order now validates
 # EVERY one of these, not just one.
-SYMBOLS = ["SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT"]
-
+SYMBOLS = ["SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT",
+           "NAS100_USDT", "COPPER_USDT", "SILVER_USDT", "XAU_USDT"]
 LEVERAGE  = 30
 ROLL_DAYS = 9   # trailing window for the 9-day-high price target, including today
 
