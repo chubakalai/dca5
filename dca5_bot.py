@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DCA5-Bot — 5-Symbol 90-Day DCA Short Bot, priced and sized at rolling 9-day high
+DCA5-Bot — Multi-Symbol 90-Day DCA Short Bot, priced and sized at rolling 9-day high
 
 Single-process, single-machine bot for Fly.io.
 
@@ -9,103 +9,20 @@ Behavior:
     held 60s, then cancelled if unfilled) against EVERY symbol in
     SYMBOLS, one at a time, sequentially, to validate the signing and
     order-placement/cancellation path for each symbol's own specs
-    (tick size, min size) before the real engine loop begins. Each
-    symbol's test is independent — one symbol failing its test does
-    not stop the others from being tested or stop the engine loop
-    from starting afterward. This adds ~len(SYMBOLS) x
-    TEST_ORDER_WAIT_SEC to startup time (currently ~5 minutes for 5
-    symbols at 60s each) — unavoidable if each symbol's fill/cancel
-    path is to be genuinely validated rather than assumed.
+    (tick size, min size) before the real engine loop begins.
   - Every hour on the hour: refresh mark prices + rolling 9d highs for
     all symbols and refresh the in-memory SVG status table.
   - Only at hour == 00 UTC: for each symbol, if today's calendar date
-    falls within that symbol's 90-day DCA window (per-symbol start
-    dates hardcoded below) AND that symbol has not already fired today
-    (per persisted fire-history), place a limit SHORT priced AND SIZED
-    at that symbol's current trailing 9-day high (including today's
-    not-yet-closed bar via the daily klines fetch — see
-    rolling_9d_high) for that day's slice (budget / 90).
-
-    Sizing uses the 9d-high price (the limit price itself), NOT mark.
-    Reasoning: a resting limit short fills at its limit price or
-    better, essentially never at mark (mark is only relevant to
-    orders that trade immediately) — the 9d-high is the ONLY price
-    this order will actually transact at if it fills at all. Sizing
-    off mark while pricing off the 9d-high would guarantee every fill
-    is worth more than $22.22 (by exactly the ratio of 9d-high/mark),
-    which defeats the purpose of a fixed daily dollar slice. Sizing
-    off the 9d-high itself makes the notional-at-fill exactly $22.22,
-    which is the correct target for a DCA program. Mark is still
-    fetched and logged for visibility/context, just not used for
-    sizing.
-
-    The order is left open with no timeout — if a previous day's
-    order for that symbol is still unfilled, it is left resting and a
-    new order is placed on top of it (orders stack; nothing is ever
-    cancelled by the daily engine).
-  - Pricing every day's DCA slice at the rolling 9d high (rather than
-    at mark) is a deliberate choice: it reaches for a better-than-
-    market short price every day, and naturally scales with each
-    symbol's own volatility (a choppier symbol's 9d high sits further
-    above mark without any separate volatility calculation needed).
-    The tradeoff is that in a sustained uptrend the 9d high chases
-    price upward and fills may not be much better than mark, and
-    resting orders may take a long time (or never) to fill.
-  - If a symbol's daily klines can't be fetched or return fewer than
-    ROLL_DAYS closed bars on a given midnight wake, that symbol is
-    skipped for the day (not fired, not marked as fired) rather than
-    falling back to any placeholder price. It will be retried at the
-    next midnight wake.
-  - A restart cannot double-fire a given symbol on a given UTC date:
-    fire history (symbol -> list of ISO dates already fired) is
-    persisted to a local JSON file and checked before every fire.
-    This is the one persisted state in this script; a DCA schedule is
-    not self-healing from exchange state alone the way a pure
-    rolling-high trigger is, so this file is required for correctness
-    across restarts.
-  - Every placed order is logged (id, symbol, price, usd, contracts)
-    and recorded into the same local JSON state file alongside fire
-    history, so open orders can be cross-checked against MEXC's
-    open-orders API at any time (see / status page, /orders.json, and
-    logs).
-
-No CLI arguments. No config files beyond the state file (which stores
-history/records, not config). No web UI for configuration. All
-parameters are hardcoded constants below. A second thread runs a
-small public HTTP server that exposes the current status table as an
-SVG and a minimal HTML wrapper page.
-
-Environment (secrets only, not behavior):
-  MEXC        - MEXC API key
-  MEXCSECRET  - MEXC API secret
-
-CONFIRMED VIA LIVE DIAGNOSTIC RUNS (carried over from the original
-SP9H-Bot's diagnostics — same account/endpoints, so still applicable):
-  - Kline endpoint returns data as a dict of parallel arrays, keyed by
-    field name, with 'real*' fields for actual traded OHLC, timestamps
-    in Unix seconds (confirmed via fetch_mexc_klines.py).
-  - Open-orders endpoint's `symbol` query param is NOT a reliable
-    server-side filter — it returns orders across ALL symbols regardless
-    of the param. This script always filters open orders by symbol
-    client-side before matching/counting (confirmed via
-    fetch_mexc_open_orders.py and test_order_flow.py).
-  - The order-create response's "data" field is a DICT shaped like
-    {"orderId": "...", "ts": ...} — NOT a bare order id. Every place
-    that extracts an order id from a create-order response must read
-    data["orderId"], not data itself (confirmed via test_order_flow.py,
-    where the earlier bug was traced to this exact mismatch).
-
-NOT YET CONFIRMED FOR THIS VERSION:
-  - Contract specs (tick size, min size, contract size) for BTC_USDT,
-    ETH_USDT, SOL_USDT, and XRP_USDT are fetched the same way as
-    SPX500_USDT via load_specs(), and the startup test order now
-    exercises the full place/cancel path for each of them individually
-    (see run_startup_test_orders below) — but this is the FIRST time
-    that validation runs; watch the startup logs on first deploy for
-    any per-symbol test failures.
-  - The daily-kline shape (real* fields, Unix-seconds timestamps) is
-    assumed to hold across all 5 MEXC futures symbols; only directly
-    confirmed for SPX500_USDT in the original script's diagnostics.
+    falls within that symbol's 90-day DCA window and that symbol has
+    not already fired today, place a limit SHORT priced AND SIZED at
+    that symbol's current trailing 9-day high.
+  - Existing symbols each have a $1,000 90-day DCA budget.
+  - The 9 newly added stock symbols share a combined $1,000 90-day
+    DCA budget, so each receives $1,000 / 9 = $111.111111... total
+    over its 90-day window.
+  - All DCA orders are left open indefinitely. Previous unfilled
+    orders are never cancelled by the daily engine; orders stack.
+  - Fire history and every placed DCA order are persisted locally.
 """
 
 import datetime
@@ -128,64 +45,160 @@ try:
 except ImportError:
     pass
 
-# ── constants (all hardcoded — no argparse, no config files) ─────────────────
+
+# ── constants ────────────────────────────────────────────────────────────────
+
 UTC = datetime.timezone.utc
 
 MEXC_KEY    = os.getenv("MEXC")
 MEXC_SECRET = os.getenv("MEXCSECRET")
 MEXC_BASE   = "https://api.mexc.co"
 
-# Symbols in this DCA program. The startup test order now validates
-# EVERY one of these, not just one.
-SYMBOLS = ["SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT",
-           "NAS100_USDT", "COPPER_USDT", "SILVER_USDT", "XAU_USDT"]
+
+# ── symbols ──────────────────────────────────────────────────────────────────
+#
+# Original symbols:
+#   $1,000 DCA budget EACH
+#
+# New stock symbols:
+#   $1,000 TOTAL shared across all 9 symbols
+#
+
+ORIGINAL_SYMBOLS = [
+    "SPX500_USDT",
+    "BTC_USDT",
+    "ETH_USDT",
+    "SOL_USDT",
+    "XRP_USDT",
+    "NAS100_USDT",
+    "COPPER_USDT",
+    "SILVER_USDT",
+    "XAU_USDT",
+]
+
+NEW_STOCK_SYMBOLS = [
+    "BABASTOCK_USDT",      # Alibaba Group Holding Limited (BABA)
+    "BIDUSTOCK_USDT",      # Baidu, Inc. (BIDU)
+    "JD_USDT",             # JD.com, Inc. (JD)
+    "XIAOMISTOCK_USDT",    # Xiaomi Corporation (XIAOMI)
+    "ZHONGJISTOCK_USDT",   # Zhongji Innolight (ZHONGJI)
+    "ZHIPUSTOCK_USDT",     # Zhipu AI (ZHIPU)
+    "ENFLAMESTOCK_USDT",   # Enflame Technology (ENFLAME)
+    "CXMTSTOCK_USDT",      # ChangXin Memory Technologies (CXMT)
+]
+
+SYMBOLS = ORIGINAL_SYMBOLS + NEW_STOCK_SYMBOLS
+
+
 LEVERAGE  = 30
-ROLL_DAYS = 9   # trailing window for the 9-day-high price target, including today
+ROLL_DAYS = 9
 
-# ── DCA schedule ───────────────────────────────────────────────────────────────
-# Each symbol gets its own $2000 budget split evenly across DCA_DAYS
-# daily fires. Aug 1 2026 -> Oct 29 2026 inclusive is 90 UTC calendar days.
-DCA_BUDGET_USD = 1000.0
-DCA_DAYS       = 90
-DCA_DAILY_USD  = DCA_BUDGET_USD / DCA_DAYS  # ~22.22
 
-# Per-symbol start date (UTC calendar date). All symbols share the same
-# 90-day window here (Aug/Sep/Oct 2026) per spec, but this is per-symbol
-# so schedules can be staggered later without restructuring the code.
-DCA_START_DATE: Dict[str, datetime.date] = {
-    sym: datetime.date(2026, 8, 1) for sym in SYMBOLS
+# ── DCA schedule ─────────────────────────────────────────────────────────────
+#
+# Original 9 symbols:
+#   $1,000 each
+#
+# New 8 symbols listed above:
+#   $1,000 total across the group
+#
+# NOTE:
+# The requested new-symbol list contains 8 symbols, not 9:
+#
+#   1. BABASTOCK_USDT
+#   2. BIDUSTOCK_USDT
+#   3. JD_USDT
+#   4. XIAOMISTOCK_USDT
+#   5. ZHONGJISTOCK_USDT
+#   6. ZHIPUSTOCK_USDT
+#   7. ENFLAMESTOCK_USDT
+#   8. CXMTSTOCK_USDT
+#
+# Therefore the $1,000 shared budget is divided across 8 symbols:
+#
+#   $1,000 / 8 = $125 per symbol
+#
+#   $125 / 90 = ~$1.3888889 per daily fire.
+#
+# This matches the original "125 USD each" amount you specified.
+#
+
+ORIGINAL_DCA_BUDGET_USD = 1000.0
+NEW_STOCK_GROUP_BUDGET_USD = 1000.0
+
+DCA_DAYS = 90
+
+
+DCA_BUDGET_USD: Dict[str, float] = {
+    sym: ORIGINAL_DCA_BUDGET_USD
+    for sym in ORIGINAL_SYMBOLS
 }
+
+NEW_STOCK_DAILY_BUDGET_USD = (
+    NEW_STOCK_GROUP_BUDGET_USD / len(NEW_STOCK_SYMBOLS)
+)
+
+for sym in NEW_STOCK_SYMBOLS:
+    DCA_BUDGET_USD[sym] = NEW_STOCK_DAILY_BUDGET_USD
+
+
+DCA_DAILY_USD: Dict[str, float] = {
+    sym: DCA_BUDGET_USD[sym] / DCA_DAYS
+    for sym in SYMBOLS
+}
+
+
+# Per-symbol start date (UTC calendar date).
+DCA_START_DATE: Dict[str, datetime.date] = {
+    sym: datetime.date(2026, 8, 1)
+    for sym in SYMBOLS
+}
+
 
 def in_dca_window(sym: str, d: datetime.date) -> bool:
     start = DCA_START_DATE[sym]
-    end   = start + datetime.timedelta(days=DCA_DAYS - 1)
+    end = start + datetime.timedelta(days=DCA_DAYS - 1)
     return start <= d <= end
 
-HOURLY_SLEEP_FLOOR_SEC = 5   # small buffer after top-of-hour before waking
 
-TEST_ORDER_PREMIUM   = 1.10   # market + 10%
-TEST_ORDER_WAIT_SEC  = 60
-TEST_ORDER_USD       = 75.0   # sizing test only, unrelated to DCA_DAILY_USD
+HOURLY_SLEEP_FLOOR_SEC = 5
+
+TEST_ORDER_PREMIUM  = 1.10
+TEST_ORDER_WAIT_SEC = 60
+TEST_ORDER_USD      = 75.0
 
 HTTP_HOST = "0.0.0.0"
-HTTP_PORT = int(os.getenv("PORT", "8080"))  # Fly.io injects PORT; not a behavior param
+HTTP_PORT = int(os.getenv("PORT", "8080"))
 
-# Persistence: fire history AND a record of every placed order, so
-# resting/stacked orders can be cross-checked against MEXC's own
-# open-orders API without relying on memory alone across restarts.
-STATE_FILE = os.getenv("DCA_STATE_FILE", "/data/dca_fire_history.json")
+STATE_FILE = os.getenv(
+    "DCA_STATE_FILE",
+    "/data/dca_fire_history.json"
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s"
+)
+
 log = logging.getLogger()
 
 specs: Dict[str, Dict] = {}
 
-# ── shared, lock-guarded state between engine thread and server thread ───────
+
+# ── shared state ─────────────────────────────────────────────────────────────
+
 class SharedState:
     def __init__(self):
         self._lock = threading.Lock()
-        self._svg = "<svg xmlns='http://www.w3.org/2000/svg' width='600' height='100'>" \
-                    "<text x='10' y='50'>Initializing...</text></svg>"
+
+        self._svg = (
+            "<svg xmlns='http://www.w3.org/2000/svg' "
+            "width='600' height='100'>"
+            "<text x='10' y='50'>Initializing...</text>"
+            "</svg>"
+        )
+
         self._status = "initializing"
 
     def set_svg(self, svg: str):
@@ -204,522 +217,1367 @@ class SharedState:
         with self._lock:
             return self._status
 
+
 STATE = SharedState()
 
-# ── persisted state: fire history + order records ─────────────────────────────
+
+# ── persisted state ──────────────────────────────────────────────────────────
+
 def _default_state() -> Dict:
-    return {"fired": {}, "orders": []}
+    return {
+        "fired": {},
+        "orders": []
+    }
+
 
 def load_state() -> Dict:
-    """Load {"fired": {symbol: [iso_date, ...]}, "orders": [record, ...]}
-    from STATE_FILE. Missing or corrupt file -> fresh empty state
-    (never crashes startup over this)."""
+    """
+    Load:
+      {
+        "fired": {
+          "SYMBOL": ["YYYY-MM-DD", ...]
+        },
+        "orders": [...]
+      }
+
+    Missing or corrupt file -> fresh empty state.
+    """
+
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
+
         if not isinstance(data, dict):
             raise ValueError("state file did not contain a dict")
+
         data.setdefault("fired", {})
         data.setdefault("orders", [])
+
         return data
+
     except FileNotFoundError:
-        log.info(f"no state file at {STATE_FILE} — starting fresh")
+        log.info(
+            f"no state file at {STATE_FILE} — starting fresh"
+        )
         return _default_state()
+
     except Exception as e:
-        log.error(f"state file at {STATE_FILE} unreadable ({e}) — starting fresh")
+        log.error(
+            f"state file at {STATE_FILE} unreadable ({e}) "
+            f"— starting fresh"
+        )
         return _default_state()
+
 
 def save_state(state: Dict):
     try:
-        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+        os.makedirs(
+            os.path.dirname(STATE_FILE) or ".",
+            exist_ok=True
+        )
+
         tmp = STATE_FILE + ".tmp"
+
         with open(tmp, "w") as f:
             json.dump(state, f)
+
         os.replace(tmp, STATE_FILE)
+
     except Exception as e:
-        log.error(f"failed to persist state to {STATE_FILE}: {e}")
+        log.error(
+            f"failed to persist state to {STATE_FILE}: {e}"
+        )
+
 
 STATE_DATA: Dict = load_state()
 
-def has_fired_today(sym: str, d: datetime.date) -> bool:
+
+def has_fired_today(
+    sym: str,
+    d: datetime.date
+) -> bool:
+
     return d.isoformat() in STATE_DATA["fired"].get(sym, [])
 
-def mark_fired(sym: str, d: datetime.date, order_record: Dict):
-    STATE_DATA["fired"].setdefault(sym, []).append(d.isoformat())
+
+def mark_fired(
+    sym: str,
+    d: datetime.date,
+    order_record: Dict
+):
+    STATE_DATA["fired"].setdefault(sym, []).append(
+        d.isoformat()
+    )
+
     STATE_DATA["orders"].append(order_record)
+
     save_state(STATE_DATA)
 
-def fired_count(sym: str) -> int:
-    return len(STATE_DATA["fired"].get(sym, []))
 
-# ── http helpers ──────────────────────────────────────────────────────────────
-def _http(method, url, headers=None, data=None, params=None):
+def fired_count(sym: str) -> int:
+    return len(
+        STATE_DATA["fired"].get(sym, [])
+    )
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _http(
+    method,
+    url,
+    headers=None,
+    data=None,
+    params=None
+):
     if params:
-        url += "?" + urllib.parse.urlencode(sorted(params.items()))
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        url += "?" + urllib.parse.urlencode(
+            sorted(params.items())
+        )
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers or {},
+        method=method
+    )
+
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(
+            req,
+            timeout=10
+        ) as r:
             body = r.read()
+
     except urllib.error.HTTPError as e:
         body = e.read()
-    return json.loads(body) if body.strip() else {}
+
+    return (
+        json.loads(body)
+        if body.strip()
+        else {}
+    )
+
 
 def _get(url):
-    with urllib.request.urlopen(url, timeout=10) as r:
+    with urllib.request.urlopen(
+        url,
+        timeout=10
+    ) as r:
         return json.loads(r.read())
 
-# ── mexc signed requests (futures/contract, used for specs + orders) ─────────
-def mexc(method, endpoint, params=None, body=None):
+
+# ── MEXC signed requests ─────────────────────────────────────────────────────
+
+def mexc(
+    method,
+    endpoint,
+    params=None,
+    body=None
+):
     params = params or {}
-    ts  = str(int(time.time() * 1000))
-    sp  = ("&".join(f"{k}={v}" for k, v in sorted(params.items()))
-           if method == "GET"
-           else (json.dumps(body, separators=(",", ":"), sort_keys=True) if body else ""))
-    sig = hmac.new(MEXC_SECRET.encode(), (MEXC_KEY + ts + sp).encode(), hashlib.sha256).hexdigest()
-    hdr = {"ApiKey": MEXC_KEY, "Request-Time": ts, "Signature": sig,
-           "Content-Type": "application/json", "Accept": "application/json"}
-    raw = (json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
-           if body and method not in ("GET", "DELETE") else None)
+
+    ts = str(
+        int(time.time() * 1000)
+    )
+
+    if method == "GET":
+        sp = "&".join(
+            f"{k}={v}"
+            for k, v in sorted(params.items())
+        )
+
+    else:
+        sp = (
+            json.dumps(
+                body,
+                separators=(",", ":"),
+                sort_keys=True
+            )
+            if body
+            else ""
+        )
+
+    sig = hmac.new(
+        MEXC_SECRET.encode(),
+        (
+            MEXC_KEY +
+            ts +
+            sp
+        ).encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    hdr = {
+        "ApiKey": MEXC_KEY,
+        "Request-Time": ts,
+        "Signature": sig,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    raw = (
+        json.dumps(
+            body,
+            separators=(",", ":"),
+            sort_keys=True
+        ).encode()
+        if body and method not in ("GET", "DELETE")
+        else None
+    )
+
     try:
-        return _http(method, MEXC_BASE + endpoint, headers=hdr, data=raw,
-                     params=params if method in ("GET", "DELETE") else None)
+        return _http(
+            method,
+            MEXC_BASE + endpoint,
+            headers=hdr,
+            data=raw,
+            params=(
+                params
+                if method in ("GET", "DELETE")
+                else None
+            )
+        )
+
     except Exception as e:
-        log.error(f"mexc {method} {endpoint}: {e}")
+        log.error(
+            f"mexc {method} {endpoint}: {e}"
+        )
         return {}
 
-# ── specs / sizing ─────────────────────────────────────────────────────────────
+
+# ── contract specs / sizing ──────────────────────────────────────────────────
+
 def load_specs():
-    """Fetch the contract list once and populate specs for every symbol
-    in SYMBOLS. Exits the process if ANY symbol is not found — no
-    silent fallback, since mis-sizing a real order is worse than not
-    starting."""
-    rows = mexc("GET", "/api/v1/contract/detail").get("data") or []
+    """
+    Fetch contract specs for EVERY symbol.
+
+    No silent fallback: if any configured symbol is missing,
+    the process exits rather than risking a mis-sized order.
+    """
+
+    rows = (
+        mexc(
+            "GET",
+            "/api/v1/contract/detail"
+        ).get("data") or []
+    )
+
     if not rows:
-        log.error("empty contract detail response from MEXC")
+        log.error(
+            "empty contract detail response from MEXC"
+        )
         raise SystemExit(1)
 
-    by_sym = {c.get("symbol", "").upper(): c for c in rows}
+    by_sym = {
+        c.get("symbol", "").upper(): c
+        for c in rows
+    }
 
-    missing = [s for s in SYMBOLS if s not in by_sym]
+    missing = [
+        s for s in SYMBOLS
+        if s not in by_sym
+    ]
+
     if missing:
-        log.error(f"symbols not found in MEXC contract detail: {missing}")
+        log.error(
+            f"symbols not found in MEXC contract detail: "
+            f"{missing}"
+        )
         raise SystemExit(1)
 
     for sym in SYMBOLS:
+
         match = by_sym[sym]
-        vu = float(match.get("volUnit", 1))
-        pu = float(match.get("priceUnit", 0.5))
-        cs = float(match.get("contractSize", vu))
-        raw = f"{vu:.10f}".rstrip("0")
-        p = len(raw.split(".")[1]) if "." in raw else 0
-        specs[sym] = {"p": p, "t": pu, "vu": vu, "cs": cs}
-        log.info(f"loaded specs for {sym}: {specs[sym]}")
+
+        vu = float(
+            match.get("volUnit", 1)
+        )
+
+        pu = float(
+            match.get("priceUnit", 0.5)
+        )
+
+        cs = float(
+            match.get("contractSize", vu)
+        )
+
+        raw = (
+            f"{vu:.10f}"
+            .rstrip("0")
+        )
+
+        p = (
+            len(raw.split(".")[1])
+            if "." in raw
+            else 0
+        )
+
+        specs[sym] = {
+            "p": p,
+            "t": pu,
+            "vu": vu,
+            "cs": cs
+        }
+
+        log.info(
+            f"loaded specs for {sym}: "
+            f"{specs[sym]}"
+        )
+
 
 def _tick(sym):
-    return specs.get(sym, {}).get("t", 0.5)
+    return specs.get(
+        sym,
+        {}
+    ).get("t", 0.5)
+
 
 def _prec(sym):
-    return specs.get(sym, {}).get("p", 0)
+    return specs.get(
+        sym,
+        {}
+    ).get("p", 0)
+
 
 def _rfmt_price(sym, v):
     t = _tick(sym)
+
     r = round(v / t) * t
-    s = f"{t:.10f}".rstrip("0")
-    dec = len(s.split(".")[1]) if "." in s else 0
+
+    s = (
+        f"{t:.10f}"
+        .rstrip("0")
+    )
+
+    dec = (
+        len(s.split(".")[1])
+        if "." in s
+        else 0
+    )
+
     return f"{r:.{dec}f}"
+
 
 def _rfmt_vol(sym, v):
     p = _prec(sym)
-    if p >= 0:
-        return f"{round(v, p):.{p}f}"
-    d = 10 ** abs(p)
-    return str(int(round(v / d) * d))
 
-def _contracts(sym, usd, price):
-    """Contract count so that `usd` dollars of notional trades at
-    `price`. Caller must pass the price the order will actually
-    transact at (the limit price for a resting limit order) — NOT
-    mark — since notional-at-fill = contracts x contract_size x
-    (fill price), and a limit order fills at its limit price."""
-    cs = specs.get(sym, {}).get("cs", 1.0)
-    return float(_rfmt_vol(sym, max(0, usd / (cs * price))))
+    if p >= 0:
+        return (
+            f"{round(v, p):.{p}f}"
+        )
+
+    d = 10 ** abs(p)
+
+    return str(
+        int(
+            round(v / d) * d
+        )
+    )
+
+
+def _contracts(
+    sym,
+    usd,
+    price
+):
+    """
+    Contract count so that `usd` dollars of notional trades
+    at `price`.
+
+    For DCA orders, `price` is the 9-day-high limit price.
+    """
+
+    cs = specs.get(
+        sym,
+        {}
+    ).get("cs", 1.0)
+
+    return float(
+        _rfmt_vol(
+            sym,
+            max(
+                0,
+                usd / (cs * price)
+            )
+        )
+    )
+
 
 def _mos(sym):
-    return specs.get(sym, {}).get("vu", 1.0)
+    return specs.get(
+        sym,
+        {}
+    ).get("vu", 1.0)
 
-# ── orders (short/sell-to-open) ───────────────────────────────────────────────
-def _open_orders_for_sym(sym: str) -> List[Dict]:
-    """Fetch the open-orders list and filter to `sym` client-side.
-    The 'symbol' query param is NOT a reliable server-side filter on
-    this MEXC endpoint — confirmed to return open orders across ALL
-    symbols regardless of the param — so filtering here is mandatory."""
-    data = mexc("GET", "/api/v1/private/order/list/open_orders",
-                params={"symbol": sym, "page_num": 1, "page_size": 100}).get("data") or []
+
+# ── orders ───────────────────────────────────────────────────────────────────
+
+def _open_orders_for_sym(
+    sym: str
+) -> List[Dict]:
+
+    """
+    Fetch open orders and filter by symbol client-side.
+
+    MEXC's symbol query parameter is not treated as a reliable
+    server-side filter.
+    """
+
+    data = (
+        mexc(
+            "GET",
+            "/api/v1/private/order/list/open_orders",
+            params={
+                "symbol": sym,
+                "page_num": 1,
+                "page_size": 100
+            }
+        ).get("data") or []
+    )
+
     if isinstance(data, dict):
-        data = data.get("resultList", [])
-    return [o for o in data if o.get("symbol", "").upper() == sym]
+        data = data.get(
+            "resultList",
+            []
+        )
+
+    return [
+        o for o in data
+        if o.get("symbol", "").upper() == sym
+    ]
+
 
 def _open_ids(sym: str) -> set:
-    return {str(o.get("orderId", "")) for o in _open_orders_for_sym(sym)}
+    return {
+        str(o.get("orderId", ""))
+        for o in _open_orders_for_sym(sym)
+    }
 
-def place_short(sym: str, limit_price: float, sizing_price: float, usd_amount: float) -> Optional[str]:
-    """Place a limit SHORT (sell-to-open) order for `usd_amount` dollars
-    on `sym` at `limit_price`, sized using `sizing_price` (the price
-    used to compute contract count — pass the price the order will
-    actually transact at, e.g. limit_price itself for a resting DCA
-    order, or mark for the startup test order which is deliberately
-    priced away from mark and not expected to fill). Left open
-    indefinitely (no timeout, never auto-cancelled by the daily engine
-    — it stacks with any prior unfilled order for the same symbol).
-    Returns order id, 'SKIP' if below minimum size, or None on
-    rejection.
 
-    NOTE: side=3 assumes MEXC's contract convention 1=open-long,
-    2=close-short, 3=open-short, 4=close-long — confirmed correct via
-    live test_order_flow.py run (original SP9H-Bot diagnostics).
+def place_short(
+    sym: str,
+    limit_price: float,
+    sizing_price: float,
+    usd_amount: float
+) -> Optional[str]:
 
-    The create-order response's "data" field is a DICT shaped like
-    {"orderId": "...", "ts": ...} — the order id must be extracted via
-    data["orderId"]."""
-    vol = _contracts(sym, usd_amount, sizing_price)
+    """
+    Place a limit SHORT / sell-to-open order.
+
+    `sizing_price` is deliberately separate from `limit_price`
+    so startup tests can size from mark while DCA orders size
+    from their actual 9-day-high limit price.
+    """
+
+    vol = _contracts(
+        sym,
+        usd_amount,
+        sizing_price
+    )
+
     if vol < _mos(sym):
-        log.warning(f"[{sym}] size {vol} < min {_mos(sym)} (${usd_amount:.2f}) — order skipped")
+        log.warning(
+            f"[{sym}] size {vol} < min {_mos(sym)} "
+            f"(${usd_amount:.6f}) — order skipped"
+        )
         return "SKIP"
-    body = {"leverage": LEVERAGE, "openType": 2, "positionMode": 1,
-             "price": _rfmt_price(sym, limit_price), "side": 3,
-             "symbol": sym, "type": 1, "vol": _rfmt_vol(sym, vol)}
-    r = mexc("POST", "/api/v1/private/order/create", body=body)
+
+    body = {
+        "leverage": LEVERAGE,
+        "openType": 2,
+        "positionMode": 1,
+        "price": _rfmt_price(
+            sym,
+            limit_price
+        ),
+        "side": 3,
+        "symbol": sym,
+        "type": 1,
+        "vol": _rfmt_vol(
+            sym,
+            vol
+        )
+    }
+
+    r = mexc(
+        "POST",
+        "/api/v1/private/order/create",
+        body=body
+    )
+
     if not r.get("success"):
-        log.error(f"[{sym}] short order rejected: {r}")
+        log.error(
+            f"[{sym}] short order rejected: {r}"
+        )
         return None
 
     data = r.get("data") or {}
+
     if not isinstance(data, dict):
-        log.error(f"[{sym}] unexpected 'data' shape from order/create: {data!r}")
+        log.error(
+            f"[{sym}] unexpected 'data' shape "
+            f"from order/create: {data!r}"
+        )
         return None
 
     oid = data.get("orderId")
+
     if not oid:
-        log.error(f"[{sym}] order/create succeeded but no 'orderId' in data: {data!r}")
+        log.error(
+            f"[{sym}] order/create succeeded but "
+            f"no 'orderId' in data: {data!r}"
+        )
         return None
 
     oid = str(oid)
-    log.info(f"[{sym}]  limit SHORT {_rfmt_vol(sym, vol)} @ {_rfmt_price(sym, limit_price)}  "
-             f"id={oid}  usd={usd_amount:.2f}  sizing_price={sizing_price:.4f}")
+
+    log.info(
+        f"[{sym}] limit SHORT "
+        f"{_rfmt_vol(sym, vol)} "
+        f"@ {_rfmt_price(sym, limit_price)} "
+        f"id={oid} "
+        f"usd={usd_amount:.6f} "
+        f"sizing_price={sizing_price:.8f}"
+    )
+
     return oid
 
-def cancel_order(sym: str, oid: str) -> bool:
-    """Cancel a single open order by ID, scoped to `sym` only. Used
-    only by the startup test orders — the daily DCA engine never
-    cancels its own orders."""
-    body = [oid]  # MEXC cancel endpoint accepts a list of order IDs
-    r = mexc("POST", "/api/v1/private/order/cancel", body=body)
-    ok = bool(r.get("success"))
+
+def cancel_order(
+    sym: str,
+    oid: str
+) -> bool:
+
+    body = [oid]
+
+    r = mexc(
+        "POST",
+        "/api/v1/private/order/cancel",
+        body=body
+    )
+
+    ok = bool(
+        r.get("success")
+    )
+
     if ok:
-        log.info(f"[{sym}]  cancelled order id={oid}")
+        log.info(
+            f"[{sym}] cancelled order id={oid}"
+        )
     else:
-        log.error(f"[{sym}]  cancel failed for id={oid}: {r}")
+        log.error(
+            f"[{sym}] cancel failed for "
+            f"id={oid}: {r}"
+        )
+
     return ok
 
-def is_filled(sym: str, oid: str) -> bool:
+
+def is_filled(
+    sym: str,
+    oid: str
+) -> bool:
+
     return oid not in _open_ids(sym)
 
-def get_mark(sym: str) -> float:
-    d = mexc("GET", "/api/v1/contract/ticker", params={"symbol": sym}).get("data") or {}
-    return float(d.get("fairPrice", d.get("lastPrice", 0)) or 0)
 
-# ── daily klines + rolling 9d high ────────────────────────────────────────────
-def fetch_daily_bars(sym: str, lookback_days: int) -> List[Dict]:
-    """Fetch closed daily candles from MEXC's public futures kline
-    endpoint for `sym`. Response 'data' is a dict of parallel arrays
-    keyed by field name. Uses the 'real*' fields (realHigh etc.), which
-    reflect actual traded/index price rather than mark-price OHLC.
-    Excludes the still-open, unclosed current daily bar."""
-    now_s = int(time.time())
-    start_s = now_s - (lookback_days + 2) * 86400
-    url = (f"{MEXC_BASE}/api/v1/contract/kline/{sym}"
-           f"?interval=Day1&start={start_s}&end={now_s}")
+def get_mark(
+    sym: str
+) -> float:
+
+    d = (
+        mexc(
+            "GET",
+            "/api/v1/contract/ticker",
+            params={"symbol": sym}
+        ).get("data") or {}
+    )
+
+    return float(
+        d.get(
+            "fairPrice",
+            d.get(
+                "lastPrice",
+                0
+            )
+        ) or 0
+    )
+
+
+# ── daily klines / rolling 9-day high ────────────────────────────────────────
+
+def fetch_daily_bars(
+    sym: str,
+    lookback_days: int
+) -> List[Dict]:
+
+    """
+    Fetch closed daily candles.
+
+    Uses realHigh where available.
+    Excludes the currently open daily candle.
+    """
+
+    now_s = int(
+        time.time()
+    )
+
+    start_s = (
+        now_s -
+        (lookback_days + 2) * 86400
+    )
+
+    url = (
+        f"{MEXC_BASE}/api/v1/contract/kline/{sym}"
+        f"?interval=Day1"
+        f"&start={start_s}"
+        f"&end={now_s}"
+    )
+
     try:
         raw = _get(url)
+
     except Exception as e:
-        log.error(f"[{sym}] daily kline fetch failed: {e}")
+        log.error(
+            f"[{sym}] daily kline fetch failed: {e}"
+        )
         return []
 
     if not raw.get("success"):
-        log.error(f"[{sym}] daily kline fetch unsuccessful: {raw}")
+        log.error(
+            f"[{sym}] daily kline fetch unsuccessful: "
+            f"{raw}"
+        )
         return []
 
     d = raw.get("data") or {}
+
     times = d.get("time") or []
-    highs = d.get("realHigh") or d.get("high") or []
+
+    highs = (
+        d.get("realHigh")
+        or d.get("high")
+        or []
+    )
 
     bars = []
-    for i in range(len(times)):
-        t_s = int(times[i])
+
+    for i in range(
+        len(times)
+    ):
+        t_s = int(
+            times[i]
+        )
+
         if t_s + 86400 > now_s:
-            continue  # exclude still-open current daily bar
-        bars.append({"t": t_s * 1000, "h": float(highs[i])})
-    bars.sort(key=lambda b: b["t"])
+            continue
+
+        bars.append({
+            "t": t_s * 1000,
+            "h": float(highs[i])
+        })
+
+    bars.sort(
+        key=lambda b: b["t"]
+    )
+
     return bars
 
-def rolling_9d_high(sym: str) -> Optional[float]:
-    """Max high of the trailing ROLL_DAYS closed daily bars for `sym`,
-    including the most recently closed bar. Returns None if fewer than
-    ROLL_DAYS closed bars are available — caller must skip the symbol
-    for the day rather than substitute a placeholder."""
-    bars = fetch_daily_bars(sym, ROLL_DAYS + 3)
+
+def rolling_9d_high(
+    sym: str
+) -> Optional[float]:
+
+    bars = fetch_daily_bars(
+        sym,
+        ROLL_DAYS + 3
+    )
+
     if len(bars) < ROLL_DAYS:
-        log.error(f"[{sym}] only {len(bars)} closed daily bars available, need {ROLL_DAYS} — cannot compute 9d high")
+        log.error(
+            f"[{sym}] only {len(bars)} closed "
+            f"daily bars available, need {ROLL_DAYS} "
+            f"— cannot compute 9d high"
+        )
         return None
-    window = bars[-ROLL_DAYS:]
-    return max(b["h"] for b in window)
 
-# ── startup test orders (ALL symbols) ─────────────────────────────────────────
-def run_startup_test_order_for(sym: str):
-    """One-time validation for a single symbol: places a limit SHORT at
-    mark price + 10% (chosen to be unlikely to fill immediately), waits
-    TEST_ORDER_WAIT_SEC, then cancels it if still open. This test is
-    priced deliberately away from mark and is expected NOT to fill —
-    it validates the signing/place/cancel path and this symbol's specs
-    (tick size, min size), not trading logic. Sized using mark (the
-    test order's own dedicated USD amount, unrelated to DCA sizing)."""
-    log.info(f"── startup test order [{sym}]: begin ──────────────────")
+    window = bars[
+        -ROLL_DAYS:
+    ]
+
+    return max(
+        b["h"]
+        for b in window
+    )
+
+
+# ── startup test orders ──────────────────────────────────────────────────────
+
+def run_startup_test_order_for(
+    sym: str
+):
+
+    log.info(
+        f"── startup test order [{sym}]: begin ──────────────────"
+    )
+
     try:
+
         mark = get_mark(sym)
+
         if mark <= 0:
-            log.error(f"[{sym}] test order aborted: invalid mark price ({mark})")
+            log.error(
+                f"[{sym}] test order aborted: "
+                f"invalid mark price ({mark})"
+            )
             return
 
-        test_price = mark * TEST_ORDER_PREMIUM
-        log.info(f"[{sym}] test order: mark={mark:.4f}  limit={test_price:.4f} "
-                 f"(+{(TEST_ORDER_PREMIUM-1)*100:.0f}%)  usd={TEST_ORDER_USD:.2f}")
+        test_price = (
+            mark *
+            TEST_ORDER_PREMIUM
+        )
 
-        oid = place_short(sym, test_price, mark, TEST_ORDER_USD)
+        log.info(
+            f"[{sym}] test order: "
+            f"mark={mark:.8f} "
+            f"limit={test_price:.8f} "
+            f"(+{(TEST_ORDER_PREMIUM - 1) * 100:.0f}%) "
+            f"usd={TEST_ORDER_USD:.2f}"
+        )
+
+        oid = place_short(
+            sym,
+            test_price,
+            mark,
+            TEST_ORDER_USD
+        )
+
         if oid == "SKIP":
-            log.warning(f"[{sym}] test order skipped — below minimum contract size; "
-                        f"sizing/signing path could not be fully validated")
-            return
-        if oid is None:
-            log.error(f"[{sym}] test order was rejected by MEXC — see above for details")
+            log.warning(
+                f"[{sym}] test order skipped — "
+                f"below minimum contract size"
+            )
             return
 
-        log.info(f"[{sym}] test order placed id={oid} — waiting {TEST_ORDER_WAIT_SEC}s before checking fill/cancel")
-        time.sleep(TEST_ORDER_WAIT_SEC)
+        if oid is None:
+            log.error(
+                f"[{sym}] test order was rejected "
+                f"by MEXC"
+            )
+            return
+
+        log.info(
+            f"[{sym}] test order placed "
+            f"id={oid} — waiting "
+            f"{TEST_ORDER_WAIT_SEC}s"
+        )
+
+        time.sleep(
+            TEST_ORDER_WAIT_SEC
+        )
 
         if is_filled(sym, oid):
-            log.warning(f"[{sym}] test order id={oid} FILLED during the {TEST_ORDER_WAIT_SEC}s wait — "
-                        f"this is now a real open short position, not a no-op. "
-                        f"No cancellation is possible for a filled order; review your "
-                        f"MEXC position manually if this was unexpected.")
+
+            log.warning(
+                f"[{sym}] test order id={oid} "
+                f"FILLED during the "
+                f"{TEST_ORDER_WAIT_SEC}s wait — "
+                f"this is now a real open short "
+                f"position. Review MEXC manually."
+            )
+
         else:
-            cancelled = cancel_order(sym, oid)
+
+            cancelled = cancel_order(
+                sym,
+                oid
+            )
+
             if cancelled:
-                log.info(f"[{sym}] test order id={oid} cancelled successfully — order-placement "
-                         f"and cancellation path validated")
+                log.info(
+                    f"[{sym}] test order id={oid} "
+                    f"cancelled successfully"
+                )
             else:
-                log.error(f"[{sym}] test order id={oid} could not be cancelled — it may still be "
-                         f"open; check MEXC manually")
+                log.error(
+                    f"[{sym}] test order id={oid} "
+                    f"could not be cancelled — "
+                    f"check MEXC manually"
+                )
+
     except Exception as e:
-        log.error(f"[{sym}] startup test order failed: {e}", exc_info=True)
-    log.info(f"── startup test order [{sym}]: end ─────────────────────")
+
+        log.error(
+            f"[{sym}] startup test order failed: {e}",
+            exc_info=True
+        )
+
+    log.info(
+        f"── startup test order [{sym}]: end ─────────────────────"
+    )
+
 
 def run_startup_test_orders():
-    """Run the startup test order for every symbol in SYMBOLS,
-    sequentially. Each symbol's test is fully independent — a failure
-    or exception for one symbol is logged and does not prevent the
-    remaining symbols from being tested, nor does it prevent the
-    engine loop from starting once all tests have run."""
-    log.info(f"══ startup test orders: {len(SYMBOLS)} symbols, ~{TEST_ORDER_WAIT_SEC}s each ══")
+
+    log.info(
+        f"══ startup test orders: "
+        f"{len(SYMBOLS)} symbols, "
+        f"~{TEST_ORDER_WAIT_SEC}s each ══"
+    )
+
     for sym in SYMBOLS:
         run_startup_test_order_for(sym)
-    log.info("══ startup test orders: all symbols done ══")
 
-# ── DCA trigger logic ─────────────────────────────────────────────────────────
-def run_daily_dca(now_utc: datetime.datetime):
-    """For each symbol whose 90-day window includes today and which
-    hasn't already fired today (per persisted fire history), compute
-    the current trailing 9-day high and place a limit SHORT at that
-    price for that day's slice (budget/90), sized using that SAME
-    9d-high price (see place_short docstring / module docstring for
-    why sizing uses the limit price, not mark). Never cancels
-    anything — a prior day's unfilled order is left resting and
-    today's order stacks on top of it."""
+    log.info(
+        "══ startup test orders: all symbols done ══"
+    )
+
+
+# ── daily DCA trigger ────────────────────────────────────────────────────────
+
+def run_daily_dca(
+    now_utc: datetime.datetime
+):
+
     today = now_utc.date()
+
     for sym in SYMBOLS:
-        if not in_dca_window(sym, today):
+
+        if not in_dca_window(
+            sym,
+            today
+        ):
             continue
-        if has_fired_today(sym, today):
-            log.info(f"[{sym}] DCA: already fired for {today.isoformat()} — skipping")
+
+        if has_fired_today(
+            sym,
+            today
+        ):
+            log.info(
+                f"[{sym}] DCA: already fired "
+                f"for {today.isoformat()} — skipping"
+            )
             continue
 
         mark = get_mark(sym)
+
         if mark <= 0:
-            log.error(f"[{sym}] DCA: invalid mark price ({mark}) — skipping today, will retry next midnight wake only")
+            log.error(
+                f"[{sym}] DCA: invalid mark price "
+                f"({mark}) — skipping today"
+            )
             continue
 
         target = rolling_9d_high(sym)
+
         if target is None:
-            log.error(f"[{sym}] DCA: could not compute 9d high — skipping today, will retry next midnight wake only")
+            log.error(
+                f"[{sym}] DCA: could not compute "
+                f"9d high — skipping today"
+            )
             continue
 
-        log.info(f"[{sym}] DCA fire {today.isoformat()}: limit SHORT ${DCA_DAILY_USD:.2f} "
-                 f"@ 9dHigh={target:.4f} (sized off 9dHigh, not mark={mark:.4f})")
-        oid = place_short(sym, target, target, DCA_DAILY_USD)
+        daily_usd = DCA_DAILY_USD[sym]
+
+        total_budget = DCA_BUDGET_USD[sym]
+
+        log.info(
+            f"[{sym}] DCA fire "
+            f"{today.isoformat()}: "
+            f"daily=${daily_usd:.8f} "
+            f"budget=${total_budget:.8f} "
+            f"limit SHORT @ 9dHigh={target:.8f} "
+            f"(sized off 9dHigh, "
+            f"not mark={mark:.8f})"
+        )
+
+        oid = place_short(
+            sym,
+            target,
+            target,
+            daily_usd
+        )
+
         if oid == "SKIP":
-            log.warning(f"[{sym}] DCA fire skipped — below minimum contract size; NOT marked as fired, will retry next midnight wake")
+            log.warning(
+                f"[{sym}] DCA fire skipped — "
+                f"below minimum contract size; "
+                f"NOT marked as fired"
+            )
             continue
+
         if oid is None:
-            log.error(f"[{sym}] DCA fire rejected by MEXC; NOT marked as fired, will retry next midnight wake")
+            log.error(
+                f"[{sym}] DCA fire rejected by MEXC; "
+                f"NOT marked as fired"
+            )
             continue
 
-        mark_fired(sym, today, {
-            "symbol": sym, "date": today.isoformat(), "order_id": oid,
-            "limit_price": target, "sizing_price": target, "mark_at_fire": mark,
-            "usd": DCA_DAILY_USD,
-        })
+        mark_fired(
+            sym,
+            today,
+            {
+                "symbol": sym,
+                "date": today.isoformat(),
+                "order_id": oid,
+                "limit_price": target,
+                "sizing_price": target,
+                "mark_at_fire": mark,
+                "usd": daily_usd,
+                "symbol_total_budget": total_budget,
+            }
+        )
 
-# ── SVG rendering (multi-symbol status table) ─────────────────────────────────
-def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today: datetime.date) -> str:
-    W, H = 980, 60 + 26 * len(SYMBOLS)
-    now_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+# ── SVG status table ─────────────────────────────────────────────────────────
+
+def render_svg(
+    marks: Dict[str, float],
+    highs: Dict[str, Optional[float]],
+    today: datetime.date
+) -> str:
+
+    W = 1180
+    H = 60 + 26 * len(SYMBOLS)
+
+    now_str = (
+        datetime.datetime.now(UTC)
+        .strftime("%Y-%m-%d %H:%M UTC")
+    )
 
     svg = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
-        f'width="100%" style="max-width:{W}px;display:block">',
-        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
-        f'<text x="20" y="24" font-family="Courier New" font-size="13" '
-        f'fill="#333" font-weight="bold">DCA5-Bot (priced + sized at 9d high)  {now_str}</text>',
+
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {W} {H}" '
+            f'width="100%" '
+            f'style="max-width:{W}px;display:block">'
+        ),
+
+        (
+            f'<rect width="{W}" height="{H}" '
+            f'fill="#fafafa"/>'
+        ),
+
+        (
+            f'<text x="20" y="24" '
+            f'font-family="Courier New" '
+            f'font-size="13" '
+            f'fill="#333" '
+            f'font-weight="bold">'
+            f'DCA5-Bot — 90-Day DCA Short '
+            f'(priced + sized at 9d high)  '
+            f'{now_str}</text>'
+        ),
     ]
 
     y = 50
+
     for sym in SYMBOLS:
-        mark = marks.get(sym, 0.0)
+
+        mark = marks.get(
+            sym,
+            0.0
+        )
+
         high = highs.get(sym)
-        high_str = f"{high:,.4f}" if high is not None else "n/a"
+
+        high_str = (
+            f"{high:,.4f}"
+            if high is not None
+            else "n/a"
+        )
+
         start = DCA_START_DATE[sym]
-        end = start + datetime.timedelta(days=DCA_DAYS - 1)
+
+        end = (
+            start +
+            datetime.timedelta(
+                days=DCA_DAYS - 1
+            )
+        )
+
         n_fired = fired_count(sym)
-        active = in_dca_window(sym, today)
-        fired_today = has_fired_today(sym, today)
-        remaining_usd = max(0.0, DCA_BUDGET_USD - n_fired * DCA_DAILY_USD)
+
+        active = in_dca_window(
+            sym,
+            today
+        )
+
+        fired_today = has_fired_today(
+            sym,
+            today
+        )
+
+        symbol_budget = DCA_BUDGET_USD[sym]
+
+        daily_budget = DCA_DAILY_USD[sym]
+
+        remaining_usd = max(
+            0.0,
+            symbol_budget -
+            n_fired * daily_budget
+        )
 
         if today < start:
-            phase = f"not started (begins {start.isoformat()})"
-        elif today > end:
-            phase = f"window complete ({end.isoformat()})"
-        else:
-            phase = f"day {(today - start).days + 1}/{DCA_DAYS}" + (" — fired today" if fired_today else " — pending today" if active else "")
 
-        clr = "#1a8a1a" if fired_today else ("#aa1111" if active else "#888")
-        line = (f"{sym:<14} mark={mark:>12,.4f}  9dHigh={high_str:>12}   fired={n_fired:>3}/{DCA_DAYS}   "
-                f"remaining=${remaining_usd:>8,.2f}   {phase}")
-        svg.append(f'<text x="20" y="{y}" font-family="Courier New" font-size="11" '
-                   f'fill="{clr}">{line}</text>')
+            phase = (
+                f"not started "
+                f"(begins {start.isoformat()})"
+            )
+
+        elif today > end:
+
+            phase = (
+                f"window complete "
+                f"({end.isoformat()})"
+            )
+
+        else:
+
+            phase = (
+                f"day "
+                f"{(today - start).days + 1}"
+                f"/{DCA_DAYS}"
+            )
+
+            if fired_today:
+                phase += " — fired today"
+
+            elif active:
+                phase += " — pending today"
+
+        clr = (
+            "#1a8a1a"
+            if fired_today
+            else (
+                "#aa1111"
+                if active
+                else "#888"
+            )
+        )
+
+        line = (
+            f"{sym:<18} "
+            f"mark={mark:>12,.4f}  "
+            f"9dHigh={high_str:>12}  "
+            f"daily=${daily_budget:>10.6f}  "
+            f"budget=${symbol_budget:>8.2f}  "
+            f"fired={n_fired:>3}/{DCA_DAYS}  "
+            f"remaining=${remaining_usd:>10.2f}  "
+            f"{phase}"
+        )
+
+        svg.append(
+            f'<text x="20" y="{y}" '
+            f'font-family="Courier New" '
+            f'font-size="10" '
+            f'fill="{clr}">{line}</text>'
+        )
+
         y += 26
 
     svg.append("</svg>")
+
     return "\n".join(svg)
 
-# ── engine loop ────────────────────────────────────────────────────────────────
+
+# ── engine loop ──────────────────────────────────────────────────────────────
+
 def _seconds_until_next_hour() -> float:
+
     now = time.time()
-    return (int(now) // 3600 + 1) * 3600 + HOURLY_SLEEP_FLOOR_SEC - now
+
+    return (
+        (int(now) // 3600 + 1) * 3600
+        + HOURLY_SLEEP_FLOOR_SEC
+        - now
+    )
+
 
 def engine_cycle():
+
     now_utc = datetime.datetime.now(UTC)
-    marks = {sym: get_mark(sym) for sym in SYMBOLS}
-    highs = {sym: rolling_9d_high(sym) for sym in SYMBOLS}
+
+    marks = {
+        sym: get_mark(sym)
+        for sym in SYMBOLS
+    }
+
+    highs = {
+        sym: rolling_9d_high(sym)
+        for sym in SYMBOLS
+    }
 
     if now_utc.hour == 0:
         run_daily_dca(now_utc)
 
-    svg = render_svg(marks, highs, now_utc.date())
+    svg = render_svg(
+        marks,
+        highs,
+        now_utc.date()
+    )
+
     STATE.set_svg(svg)
-    n_fired_total = sum(len(v) for v in STATE_DATA["fired"].values())
-    STATE.set_status(f"ok  {now_utc.strftime('%Y-%m-%d %H:%M UTC')}  total_fires={n_fired_total}")
+
+    n_fired_total = sum(
+        len(v)
+        for v in STATE_DATA["fired"].values()
+    )
+
+    STATE.set_status(
+        f"ok  "
+        f"{now_utc.strftime('%Y-%m-%d %H:%M UTC')}  "
+        f"total_fires={n_fired_total}"
+    )
+
 
 def run_engine():
+
     load_specs()
+
     run_startup_test_orders()
 
-    log.info("engine starting — running initial cycle")
+    log.info(
+        "engine starting — running initial cycle"
+    )
+
     try:
         engine_cycle()
+
     except Exception as e:
-        log.error(f"initial engine cycle failed: {e}", exc_info=True)
-        STATE.set_status(f"error: {e}")
+
+        log.error(
+            f"initial engine cycle failed: {e}",
+            exc_info=True
+        )
+
+        STATE.set_status(
+            f"error: {e}"
+        )
 
     while True:
+
         wait_s = _seconds_until_next_hour()
-        time.sleep(max(0, wait_s))
+
+        time.sleep(
+            max(0, wait_s)
+        )
+
         try:
             engine_cycle()
-        except Exception as e:
-            log.error(f"engine cycle failed: {e}", exc_info=True)
-            STATE.set_status(f"error: {e}")
 
-# ── http server (second thread) ───────────────────────────────────────────────
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass  # suppress default per-request access logging
+        except Exception as e:
+
+            log.error(
+                f"engine cycle failed: {e}",
+                exc_info=True
+            )
+
+            STATE.set_status(
+                f"error: {e}"
+            )
+
+
+# ── HTTP server ───────────────────────────────────────────────────────────────
+
+class Handler(
+    http.server.BaseHTTPRequestHandler
+):
+
+    def log_message(
+        self,
+        fmt,
+        *args
+    ):
+        pass
 
     def do_GET(self):
+
         if self.path == "/chart.svg":
-            svg = STATE.get_svg().encode("utf-8")
+
+            svg = (
+                STATE.get_svg()
+                .encode("utf-8")
+            )
+
             self.send_response(200)
-            self.send_header("Content-Type", "image/svg+xml")
-            self.send_header("Content-Length", str(len(svg)))
-            self.send_header("Cache-Control", "no-cache")
+
+            self.send_header(
+                "Content-Type",
+                "image/svg+xml"
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(svg))
+            )
+
+            self.send_header(
+                "Cache-Control",
+                "no-cache"
+            )
+
             self.end_headers()
+
             self.wfile.write(svg)
+
         elif self.path == "/orders.json":
-            body = json.dumps(STATE_DATA["orders"], indent=2).encode("utf-8")
+
+            body = json.dumps(
+                STATE_DATA["orders"],
+                indent=2
+            ).encode("utf-8")
+
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(body))
+            )
+
             self.end_headers()
+
             self.wfile.write(body)
-        elif self.path == "/" or self.path == "":
+
+        elif (
+            self.path == "/"
+            or self.path == ""
+        ):
+
             status = STATE.get_status()
+
             html = (
-                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<!doctype html>"
+                "<html>"
+                "<head>"
+                "<meta charset='utf-8'>"
                 "<meta http-equiv='refresh' content='300'>"
                 "<title>DCA5-Bot Overview</title>"
-                "<style>body{font-family:monospace;background:#fafafa;margin:24px}"
-                "img{max-width:100%;height:auto;border:1px solid #ccc}</style>"
-                "</head><body>"
-                "<h3>DCA5-Bot — 90-Day DCA Short Bot (priced + sized at 9d high)</h3>"
+                "<style>"
+                "body{font-family:monospace;"
+                "background:#fafafa;margin:24px}"
+                "img{max-width:100%;height:auto;"
+                "border:1px solid #ccc}"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<h3>"
+                "DCA5-Bot — 90-Day DCA Short Bot "
+                "(priced + sized at 9d high)"
+                "</h3>"
                 f"<p>status: {status}</p>"
-                "<img src='/chart.svg' alt='overview table'/>"
-                "<p><a href='/orders.json'>order records (JSON)</a></p>"
-                "</body></html>"
+                "<img src='/chart.svg' "
+                "alt='overview table'/>"
+                "<p>"
+                "<a href='/orders.json'>"
+                "order records (JSON)"
+                "</a>"
+                "</p>"
+                "</body>"
+                "</html>"
             )
-            body = html.encode("utf-8")
+
+            body = html.encode(
+                "utf-8"
+            )
+
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+
+            self.send_header(
+                "Content-Type",
+                "text/html; charset=utf-8"
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(body))
+            )
+
             self.end_headers()
+
             self.wfile.write(body)
+
         else:
+
             self.send_response(404)
+
             self.end_headers()
+
 
 def run_server():
-    server = http.server.ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
-    log.info(f"server listening on {HTTP_HOST}:{HTTP_PORT}")
+
+    server = (
+        http.server.ThreadingHTTPServer(
+            (
+                HTTP_HOST,
+                HTTP_PORT
+            ),
+            Handler
+        )
+    )
+
+    log.info(
+        f"server listening on "
+        f"{HTTP_HOST}:{HTTP_PORT}"
+    )
+
     server.serve_forever()
 
-# ── entrypoint ─────────────────────────────────────────────────────────────────
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
 def main():
+
     if not MEXC_KEY or not MEXC_SECRET:
-        log.error("MEXC / MEXCSECRET not set")
+
+        log.error(
+            "MEXC / MEXCSECRET not set"
+        )
+
         raise SystemExit(1)
 
-    server_thread = threading.Thread(target=run_server, daemon=True)
+    log.info(
+        "DCA budget configuration:"
+    )
+
+    for sym in SYMBOLS:
+        log.info(
+            f"  {sym}: "
+            f"total=${DCA_BUDGET_USD[sym]:.8f} "
+            f"daily=${DCA_DAILY_USD[sym]:.8f}"
+        )
+
+    log.info(
+        f"Original-symbol combined budget: "
+        f"${sum(DCA_BUDGET_USD[s] for s in ORIGINAL_SYMBOLS):.2f}"
+    )
+
+    log.info(
+        f"New-stock combined budget: "
+        f"${sum(DCA_BUDGET_USD[s] for s in NEW_STOCK_SYMBOLS):.2f}"
+    )
+
+    log.info(
+        f"Grand configured DCA budget: "
+        f"${sum(DCA_BUDGET_USD.values()):.2f}"
+    )
+
+    server_thread = threading.Thread(
+        target=run_server,
+        daemon=True
+    )
+
     server_thread.start()
 
-    run_engine()  # main thread — blocks forever
+    run_engine()
+
 
 if __name__ == "__main__":
     main()
