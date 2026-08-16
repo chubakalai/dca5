@@ -1,28 +1,70 @@
 #!/usr/bin/env python3
 """
-DCA5-Bot — Multi-Symbol 90-Day DCA Short Bot, priced and sized at rolling 9-day high
-
-Single-process, single-machine bot for Fly.io.
+DCA5-Bot — Multi-Symbol 90-Day DCA Short Bot
+priced and sized at rolling 9-day high
 
 Behavior:
-  - On startup: run a one-time TEST order (limit short at market+10%,
-    held 60s, then cancelled if unfilled) against EVERY symbol in
-    SYMBOLS, one at a time, sequentially, to validate the signing and
-    order-placement/cancellation path for each symbol's own specs
-    (tick size, min size) before the real engine loop begins.
-  - Every hour on the hour: refresh mark prices + rolling 9d highs for
-    all symbols and refresh the in-memory SVG status table.
-  - Only at hour == 00 UTC: for each symbol, if today's calendar date
-    falls within that symbol's 90-day DCA window and that symbol has
-    not already fired today, place a limit SHORT priced AND SIZED at
-    that symbol's current trailing 9-day high.
-  - Existing symbols each have a $1,000 90-day DCA budget.
-  - The 9 newly added stock symbols share a combined $1,000 90-day
-    DCA budget, so each receives $1,000 / 9 = $111.111111... total
-    over its 90-day window.
-  - All DCA orders are left open indefinitely. Previous unfilled
-    orders are never cancelled by the daily engine; orders stack.
-  - Fire history and every placed DCA order are persisted locally.
+  - On startup: run one TEST order against EVERY symbol, sequentially.
+    Each test order:
+      * uses the symbol's current mark + 10% as the limit price
+      * uses EXACTLY the symbol's minimum contract volume
+      * therefore tests the minimum order-size threshold
+      * waits TEST_ORDER_WAIT_SEC
+      * cancels if still open
+    A symbol failing its test does not prevent other symbols from being
+    tested or the engine from starting.
+
+  - Every hour on the hour:
+      * refresh mark prices
+      * refresh rolling 9-day highs
+      * refresh the SVG status table
+
+  - At hour == 00 UTC:
+      * each symbol receives one daily DCA allocation
+      * the allocation is ACCRUED in persistent state
+      * if the accrued amount is not above that symbol's minimum
+        executable notional, no order is placed
+      * once accrued USD exceeds the minimum executable notional,
+        one limit SHORT is placed for the entire accrued amount
+      * the order is priced AND sized at the current rolling 9-day high
+      * only after successful order placement is the accumulator reset
+      * the current date is then recorded as fired
+
+  - Existing symbols:
+      * $1,000 total budget EACH over 90 days
+      * $11.111111... daily allocation
+
+  - New stock symbols:
+      * $1,000 total shared budget
+      * There are 8 new symbols in the supplied list
+      * therefore $125 total per symbol
+      * $1.388888... daily allocation per symbol
+
+  - DCA orders are never automatically cancelled.
+    Previous unfilled orders remain open and new orders may stack.
+
+  - If a daily kline fetch fails or fewer than ROLL_DAYS closed bars
+    are available, that symbol receives no daily allocation for that
+    wake and is retried at the next midnight wake.
+
+  - Fire history, order records, and accrued-but-not-yet-ordered DCA
+    amounts are persisted to STATE_FILE.
+
+  - The persisted accumulator is important: if a symbol has accumulated
+    several days of DCA allocation and the process restarts, the
+    accumulated amount survives the restart.
+
+Environment:
+  MEXC        - MEXC API key
+  MEXCSECRET  - MEXC API secret
+
+MEXC diagnostics carried over from previous live tests:
+  - Kline endpoint returns parallel arrays.
+  - realHigh is used for actual traded-price OHLC.
+  - timestamps are Unix seconds.
+  - open-orders symbol filtering is unreliable server-side, so this
+    script filters by symbol client-side.
+  - order-create response data is a dict containing orderId.
 """
 
 import datetime
@@ -39,6 +81,7 @@ import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
 
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -50,19 +93,12 @@ except ImportError:
 
 UTC = datetime.timezone.utc
 
-MEXC_KEY    = os.getenv("MEXC")
+MEXC_KEY = os.getenv("MEXC")
 MEXC_SECRET = os.getenv("MEXCSECRET")
-MEXC_BASE   = "https://api.mexc.co"
+MEXC_BASE = "https://api.mexc.co"
 
 
 # ── symbols ──────────────────────────────────────────────────────────────────
-#
-# Original symbols:
-#   $1,000 DCA budget EACH
-#
-# New stock symbols:
-#   $1,000 TOTAL shared across all 9 symbols
-#
 
 ORIGINAL_SYMBOLS = [
     "SPX500_USDT",
@@ -90,56 +126,31 @@ NEW_STOCK_SYMBOLS = [
 SYMBOLS = ORIGINAL_SYMBOLS + NEW_STOCK_SYMBOLS
 
 
-LEVERAGE  = 30
+LEVERAGE = 30
 ROLL_DAYS = 9
 
 
-# ── DCA schedule ─────────────────────────────────────────────────────────────
-#
-# Original 9 symbols:
-#   $1,000 each
-#
-# New 8 symbols listed above:
-#   $1,000 total across the group
-#
-# NOTE:
-# The requested new-symbol list contains 8 symbols, not 9:
-#
-#   1. BABASTOCK_USDT
-#   2. BIDUSTOCK_USDT
-#   3. JD_USDT
-#   4. XIAOMISTOCK_USDT
-#   5. ZHONGJISTOCK_USDT
-#   6. ZHIPUSTOCK_USDT
-#   7. ENFLAMESTOCK_USDT
-#   8. CXMTSTOCK_USDT
-#
-# Therefore the $1,000 shared budget is divided across 8 symbols:
-#
-#   $1,000 / 8 = $125 per symbol
-#
-#   $125 / 90 = ~$1.3888889 per daily fire.
-#
-# This matches the original "125 USD each" amount you specified.
-#
-
-ORIGINAL_DCA_BUDGET_USD = 1000.0
-NEW_STOCK_GROUP_BUDGET_USD = 1000.0
+# ── DCA budgets ──────────────────────────────────────────────────────────────
 
 DCA_DAYS = 90
 
+ORIGINAL_DCA_BUDGET_USD = 1000.0
+
+# All 8 newly supplied stock symbols share this pool.
+NEW_STOCK_GROUP_BUDGET_USD = 1000.0
 
 DCA_BUDGET_USD: Dict[str, float] = {
     sym: ORIGINAL_DCA_BUDGET_USD
     for sym in ORIGINAL_SYMBOLS
 }
 
-NEW_STOCK_DAILY_BUDGET_USD = (
-    NEW_STOCK_GROUP_BUDGET_USD / len(NEW_STOCK_SYMBOLS)
+NEW_STOCK_PER_SYMBOL_BUDGET_USD = (
+    NEW_STOCK_GROUP_BUDGET_USD /
+    len(NEW_STOCK_SYMBOLS)
 )
 
 for sym in NEW_STOCK_SYMBOLS:
-    DCA_BUDGET_USD[sym] = NEW_STOCK_DAILY_BUDGET_USD
+    DCA_BUDGET_USD[sym] = NEW_STOCK_PER_SYMBOL_BUDGET_USD
 
 
 DCA_DAILY_USD: Dict[str, float] = {
@@ -148,33 +159,48 @@ DCA_DAILY_USD: Dict[str, float] = {
 }
 
 
-# Per-symbol start date (UTC calendar date).
+# ── DCA dates ────────────────────────────────────────────────────────────────
+
 DCA_START_DATE: Dict[str, datetime.date] = {
     sym: datetime.date(2026, 8, 1)
     for sym in SYMBOLS
 }
 
 
-def in_dca_window(sym: str, d: datetime.date) -> bool:
+def in_dca_window(
+    sym: str,
+    d: datetime.date
+) -> bool:
+
     start = DCA_START_DATE[sym]
-    end = start + datetime.timedelta(days=DCA_DAYS - 1)
+
+    end = (
+        start +
+        datetime.timedelta(days=DCA_DAYS - 1)
+    )
+
     return start <= d <= end
 
 
+# ── timing / testing ─────────────────────────────────────────────────────────
+
 HOURLY_SLEEP_FLOOR_SEC = 5
 
-TEST_ORDER_PREMIUM  = 1.10
+TEST_ORDER_PREMIUM = 1.10
 TEST_ORDER_WAIT_SEC = 60
-TEST_ORDER_USD      = 75.0
 
 HTTP_HOST = "0.0.0.0"
-HTTP_PORT = int(os.getenv("PORT", "8080"))
+HTTP_PORT = int(
+    os.getenv("PORT", "8080")
+)
 
 STATE_FILE = os.getenv(
     "DCA_STATE_FILE",
     "/data/dca_fire_history.json"
 )
 
+
+# ── logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -183,12 +209,16 @@ logging.basicConfig(
 
 log = logging.getLogger()
 
+
+# ── contract specifications ──────────────────────────────────────────────────
+
 specs: Dict[str, Dict] = {}
 
 
-# ── shared state ─────────────────────────────────────────────────────────────
+# ── shared server state ──────────────────────────────────────────────────────
 
 class SharedState:
+
     def __init__(self):
         self._lock = threading.Lock()
 
@@ -226,51 +256,90 @@ STATE = SharedState()
 def _default_state() -> Dict:
     return {
         "fired": {},
-        "orders": []
+        "orders": [],
+        "accrued": {},
     }
 
 
 def load_state() -> Dict:
     """
-    Load:
+    Load persisted state.
+
+    State shape:
+
       {
         "fired": {
-          "SYMBOL": ["YYYY-MM-DD", ...]
+          "SYMBOL": [
+            "YYYY-MM-DD",
+            ...
+          ]
         },
-        "orders": [...]
+
+        "orders": [
+          {...}
+        ],
+
+        "accrued": {
+          "SYMBOL": 12.345678
+        }
       }
 
-    Missing or corrupt file -> fresh empty state.
+    Older state files without "accrued" are automatically upgraded.
     """
 
     try:
-        with open(STATE_FILE, "r") as f:
+
+        with open(
+            STATE_FILE,
+            "r"
+        ) as f:
             data = json.load(f)
 
         if not isinstance(data, dict):
-            raise ValueError("state file did not contain a dict")
+            raise ValueError(
+                "state file did not contain a dict"
+            )
 
-        data.setdefault("fired", {})
-        data.setdefault("orders", [])
+        data.setdefault(
+            "fired",
+            {}
+        )
+
+        data.setdefault(
+            "orders",
+            []
+        )
+
+        data.setdefault(
+            "accrued",
+            {}
+        )
 
         return data
 
     except FileNotFoundError:
+
         log.info(
-            f"no state file at {STATE_FILE} — starting fresh"
+            f"no state file at {STATE_FILE} "
+            f"— starting fresh"
         )
+
         return _default_state()
 
     except Exception as e:
+
         log.error(
-            f"state file at {STATE_FILE} unreadable ({e}) "
-            f"— starting fresh"
+            f"state file at {STATE_FILE} unreadable "
+            f"({e}) — starting fresh"
         )
+
         return _default_state()
 
 
 def save_state(state: Dict):
+
     try:
+
         os.makedirs(
             os.path.dirname(STATE_FILE) or ".",
             exist_ok=True
@@ -278,14 +347,25 @@ def save_state(state: Dict):
 
         tmp = STATE_FILE + ".tmp"
 
-        with open(tmp, "w") as f:
-            json.dump(state, f)
+        with open(
+            tmp,
+            "w"
+        ) as f:
+            json.dump(
+                state,
+                f
+            )
 
-        os.replace(tmp, STATE_FILE)
+        os.replace(
+            tmp,
+            STATE_FILE
+        )
 
     except Exception as e:
+
         log.error(
-            f"failed to persist state to {STATE_FILE}: {e}"
+            f"failed to persist state to "
+            f"{STATE_FILE}: {e}"
         )
 
 
@@ -297,26 +377,78 @@ def has_fired_today(
     d: datetime.date
 ) -> bool:
 
-    return d.isoformat() in STATE_DATA["fired"].get(sym, [])
+    return (
+        d.isoformat()
+        in STATE_DATA["fired"].get(
+            sym,
+            []
+        )
+    )
 
 
-def mark_fired(
+def fired_count(
+    sym: str
+) -> int:
+
+    return len(
+        STATE_DATA["fired"].get(
+            sym,
+            []
+        )
+    )
+
+
+def get_accrued(
+    sym: str
+) -> float:
+
+    try:
+        return float(
+            STATE_DATA["accrued"].get(
+                sym,
+                0.0
+            )
+        )
+    except Exception:
+        return 0.0
+
+
+def set_accrued(
+    sym: str,
+    amount: float
+):
+
+    STATE_DATA["accrued"][sym] = max(
+        0.0,
+        float(amount)
+    )
+
+
+def record_successful_dca(
     sym: str,
     d: datetime.date,
     order_record: Dict
 ):
-    STATE_DATA["fired"].setdefault(sym, []).append(
+    """
+    Reset the accumulated DCA bucket and record the fire only after
+    the exchange accepted the order.
+    """
+
+    STATE_DATA["fired"].setdefault(
+        sym,
+        []
+    ).append(
         d.isoformat()
     )
 
-    STATE_DATA["orders"].append(order_record)
+    STATE_DATA["orders"].append(
+        order_record
+    )
 
-    save_state(STATE_DATA)
+    STATE_DATA["accrued"][sym] = 0.0
 
-
-def fired_count(sym: str) -> int:
-    return len(
-        STATE_DATA["fired"].get(sym, [])
+    save_state(
+        STATE_DATA
     )
 
 
@@ -331,7 +463,9 @@ def _http(
 ):
     if params:
         url += "?" + urllib.parse.urlencode(
-            sorted(params.items())
+            sorted(
+                params.items()
+            )
         )
 
     req = urllib.request.Request(
@@ -342,13 +476,16 @@ def _http(
     )
 
     try:
+
         with urllib.request.urlopen(
             req,
             timeout=10
         ) as r:
+
             body = r.read()
 
     except urllib.error.HTTPError as e:
+
         body = e.read()
 
     return (
@@ -359,11 +496,15 @@ def _http(
 
 
 def _get(url):
+
     with urllib.request.urlopen(
         url,
         timeout=10
     ) as r:
-        return json.loads(r.read())
+
+        return json.loads(
+            r.read()
+        )
 
 
 # ── MEXC signed requests ─────────────────────────────────────────────────────
@@ -374,23 +515,33 @@ def mexc(
     params=None,
     body=None
 ):
+
     params = params or {}
 
     ts = str(
-        int(time.time() * 1000)
+        int(
+            time.time() * 1000
+        )
     )
 
     if method == "GET":
+
         sp = "&".join(
             f"{k}={v}"
-            for k, v in sorted(params.items())
+            for k, v in sorted(
+                params.items()
+            )
         )
 
     else:
+
         sp = (
             json.dumps(
                 body,
-                separators=(",", ":"),
+                separators=(
+                    ",",
+                    ":"
+                ),
                 sort_keys=True
             )
             if body
@@ -412,20 +563,27 @@ def mexc(
         "Request-Time": ts,
         "Signature": sig,
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
 
     raw = (
         json.dumps(
             body,
-            separators=(",", ":"),
+            separators=(
+                ",",
+                ":"
+            ),
             sort_keys=True
         ).encode()
-        if body and method not in ("GET", "DELETE")
+        if body and method not in (
+            "GET",
+            "DELETE"
+        )
         else None
     )
 
     try:
+
         return _http(
             method,
             MEXC_BASE + endpoint,
@@ -433,26 +591,33 @@ def mexc(
             data=raw,
             params=(
                 params
-                if method in ("GET", "DELETE")
+                if method in (
+                    "GET",
+                    "DELETE"
+                )
                 else None
             )
         )
 
     except Exception as e:
+
         log.error(
-            f"mexc {method} {endpoint}: {e}"
+            f"mexc {method} "
+            f"{endpoint}: {e}"
         )
+
         return {}
 
 
-# ── contract specs / sizing ──────────────────────────────────────────────────
+# ── contract specs ────────────────────────────────────────────────────────────
 
 def load_specs():
-    """
-    Fetch contract specs for EVERY symbol.
 
-    No silent fallback: if any configured symbol is missing,
-    the process exits rather than risking a mis-sized order.
+    """
+    Fetch contract specifications for every symbol.
+
+    No silent fallback. If a symbol does not exist in MEXC contract
+    detail, the process exits rather than risking a bad order.
     """
 
     rows = (
@@ -463,26 +628,35 @@ def load_specs():
     )
 
     if not rows:
+
         log.error(
-            "empty contract detail response from MEXC"
+            "empty contract detail response "
+            "from MEXC"
         )
+
         raise SystemExit(1)
 
     by_sym = {
-        c.get("symbol", "").upper(): c
+        c.get(
+            "symbol",
+            ""
+        ).upper(): c
         for c in rows
     }
 
     missing = [
-        s for s in SYMBOLS
+        s
+        for s in SYMBOLS
         if s not in by_sym
     ]
 
     if missing:
+
         log.error(
-            f"symbols not found in MEXC contract detail: "
-            f"{missing}"
+            "symbols not found in MEXC "
+            f"contract detail: {missing}"
         )
+
         raise SystemExit(1)
 
     for sym in SYMBOLS:
@@ -490,15 +664,24 @@ def load_specs():
         match = by_sym[sym]
 
         vu = float(
-            match.get("volUnit", 1)
+            match.get(
+                "volUnit",
+                1
+            )
         )
 
         pu = float(
-            match.get("priceUnit", 0.5)
+            match.get(
+                "priceUnit",
+                0.5
+            )
         )
 
         cs = float(
-            match.get("contractSize", vu)
+            match.get(
+                "contractSize",
+                vu
+            )
         )
 
         raw = (
@@ -507,7 +690,9 @@ def load_specs():
         )
 
         p = (
-            len(raw.split(".")[1])
+            len(
+                raw.split(".")[1]
+            )
             if "." in raw
             else 0
         )
@@ -516,7 +701,7 @@ def load_specs():
             "p": p,
             "t": pu,
             "vu": vu,
-            "cs": cs
+            "cs": cs,
         }
 
         log.info(
@@ -526,23 +711,39 @@ def load_specs():
 
 
 def _tick(sym):
+
     return specs.get(
         sym,
         {}
-    ).get("t", 0.5)
+    ).get(
+        "t",
+        0.5
+    )
 
 
 def _prec(sym):
+
     return specs.get(
         sym,
         {}
-    ).get("p", 0)
+    ).get(
+        "p",
+        0
+    )
 
 
-def _rfmt_price(sym, v):
+def _rfmt_price(
+    sym,
+    v
+):
+
     t = _tick(sym)
 
-    r = round(v / t) * t
+    r = (
+        round(
+            v / t
+        ) * t
+    )
 
     s = (
         f"{t:.10f}"
@@ -550,18 +751,27 @@ def _rfmt_price(sym, v):
     )
 
     dec = (
-        len(s.split(".")[1])
+        len(
+            s.split(".")[1]
+        )
         if "." in s
         else 0
     )
 
-    return f"{r:.{dec}f}"
+    return (
+        f"{r:.{dec}f}"
+    )
 
 
-def _rfmt_vol(sym, v):
+def _rfmt_vol(
+    sym,
+    v
+):
+
     p = _prec(sym)
 
     if p >= 0:
+
         return (
             f"{round(v, p):.{p}f}"
         )
@@ -570,8 +780,63 @@ def _rfmt_vol(sym, v):
 
     return str(
         int(
-            round(v / d) * d
+            round(
+                v / d
+            ) * d
         )
+    )
+
+
+def _min_contracts(
+    sym
+) -> float:
+
+    return float(
+        specs.get(
+            sym,
+            {}
+        ).get(
+            "vu",
+            1.0
+        )
+    )
+
+
+def _contract_size(
+    sym
+) -> float:
+
+    return float(
+        specs.get(
+            sym,
+            {}
+        ).get(
+            "cs",
+            1.0
+        )
+    )
+
+
+def _min_notional_usd(
+    sym,
+    price
+) -> float:
+
+    """
+    Minimum executable notional at a given price.
+
+    MEXC's minimum is expressed as contract volume, so the
+    corresponding USD notional depends on the order price:
+
+        min_contracts × contract_size × price
+    """
+
+    return (
+        _min_contracts(sym)
+        *
+        _contract_size(sym)
+        *
+        price
     )
 
 
@@ -580,34 +845,57 @@ def _contracts(
     usd,
     price
 ):
-    """
-    Contract count so that `usd` dollars of notional trades
-    at `price`.
 
-    For DCA orders, `price` is the 9-day-high limit price.
+    """
+    Calculate contract count for a USD notional at `price`.
+
+    The returned volume is rounded according to the symbol's
+    volume precision.
     """
 
-    cs = specs.get(
-        sym,
-        {}
-    ).get("cs", 1.0)
+    cs = _contract_size(sym)
+
+    if price <= 0:
+        return 0.0
 
     return float(
         _rfmt_vol(
             sym,
             max(
                 0,
-                usd / (cs * price)
+                usd / (
+                    cs * price
+                )
             )
         )
     )
 
 
-def _mos(sym):
-    return specs.get(
-        sym,
-        {}
-    ).get("vu", 1.0)
+# ── market data ──────────────────────────────────────────────────────────────
+
+def get_mark(
+    sym: str
+) -> float:
+
+    d = (
+        mexc(
+            "GET",
+            "/api/v1/contract/ticker",
+            params={
+                "symbol": sym
+            }
+        ).get("data") or {}
+    )
+
+    return float(
+        d.get(
+            "fairPrice",
+            d.get(
+                "lastPrice",
+                0
+            )
+        ) or 0
+    )
 
 
 # ── orders ───────────────────────────────────────────────────────────────────
@@ -617,10 +905,8 @@ def _open_orders_for_sym(
 ) -> List[Dict]:
 
     """
-    Fetch open orders and filter by symbol client-side.
-
-    MEXC's symbol query parameter is not treated as a reliable
-    server-side filter.
+    MEXC's symbol query parameter is not considered reliable.
+    Filter the returned list by symbol locally.
     """
 
     data = (
@@ -630,26 +916,42 @@ def _open_orders_for_sym(
             params={
                 "symbol": sym,
                 "page_num": 1,
-                "page_size": 100
+                "page_size": 100,
             }
         ).get("data") or []
     )
 
-    if isinstance(data, dict):
+    if isinstance(
+        data,
+        dict
+    ):
+
         data = data.get(
             "resultList",
             []
         )
 
     return [
-        o for o in data
-        if o.get("symbol", "").upper() == sym
+        o
+        for o in data
+        if o.get(
+            "symbol",
+            ""
+        ).upper() == sym
     ]
 
 
-def _open_ids(sym: str) -> set:
+def _open_ids(
+    sym: str
+) -> set:
+
     return {
-        str(o.get("orderId", ""))
+        str(
+            o.get(
+                "orderId",
+                ""
+            )
+        )
         for o in _open_orders_for_sym(sym)
     }
 
@@ -662,11 +964,19 @@ def place_short(
 ) -> Optional[str]:
 
     """
-    Place a limit SHORT / sell-to-open order.
+    Place a limit SHORT order.
 
-    `sizing_price` is deliberately separate from `limit_price`
-    so startup tests can size from mark while DCA orders size
-    from their actual 9-day-high limit price.
+    For normal DCA orders:
+        sizing_price == limit_price == 9d high.
+
+    For startup tests:
+        sizing_price == mark,
+        limit_price == mark * 1.10.
+
+    Returns:
+        order ID
+        "SKIP" if below minimum volume
+        None on exchange rejection
     """
 
     vol = _contracts(
@@ -675,11 +985,18 @@ def place_short(
         sizing_price
     )
 
-    if vol < _mos(sym):
+    min_vol = _min_contracts(sym)
+
+    if vol < min_vol:
+
         log.warning(
-            f"[{sym}] size {vol} < min {_mos(sym)} "
-            f"(${usd_amount:.6f}) — order skipped"
+            f"[{sym}] calculated volume "
+            f"{vol} < minimum "
+            f"{min_vol} "
+            f"for ${usd_amount:.8f} "
+            f"at price {sizing_price:.8f}"
         )
+
         return "SKIP"
 
     body = {
@@ -696,7 +1013,7 @@ def place_short(
         "vol": _rfmt_vol(
             sym,
             vol
-        )
+        ),
     }
 
     r = mexc(
@@ -706,38 +1023,188 @@ def place_short(
     )
 
     if not r.get("success"):
+
         log.error(
-            f"[{sym}] short order rejected: {r}"
+            f"[{sym}] short order rejected: "
+            f"{r}"
         )
+
         return None
 
-    data = r.get("data") or {}
+    data = (
+        r.get("data")
+        or {}
+    )
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict
+    ):
+
         log.error(
             f"[{sym}] unexpected 'data' shape "
             f"from order/create: {data!r}"
         )
+
         return None
 
-    oid = data.get("orderId")
+    oid = data.get(
+        "orderId"
+    )
 
     if not oid:
+
         log.error(
-            f"[{sym}] order/create succeeded but "
-            f"no 'orderId' in data: {data!r}"
+            f"[{sym}] order/create succeeded "
+            f"but no 'orderId' in data: "
+            f"{data!r}"
         )
+
+        return None
+
+    oid = str(oid)
+
+    actual_notional = (
+        vol
+        *
+        _contract_size(sym)
+        *
+        limit_price
+    )
+
+    log.info(
+        f"[{sym}] limit SHORT "
+        f"vol={_rfmt_vol(sym, vol)} "
+        f"@ {_rfmt_price(sym, limit_price)} "
+        f"id={oid} "
+        f"requested_usd={usd_amount:.8f} "
+        f"actual_limit_notional="
+        f"${actual_notional:.8f} "
+        f"sizing_price={sizing_price:.8f}"
+    )
+
+    return oid
+
+
+def place_minimum_test_short(
+    sym: str,
+    limit_price: float
+) -> Optional[str]:
+
+    """
+    Place exactly the symbol's minimum contract volume.
+
+    This is deliberately NOT calculated through the normal USD
+    sizing path. The purpose is to test the exchange's minimum
+    order-volume threshold directly.
+
+    The resulting order notional is:
+
+        minimum_volume
+        × contract_size
+        × limit_price
+
+    That is the exact minimum executable notional at this price.
+    """
+
+    min_vol = _min_contracts(sym)
+
+    body = {
+        "leverage": LEVERAGE,
+        "openType": 2,
+        "positionMode": 1,
+        "price": _rfmt_price(
+            sym,
+            limit_price
+        ),
+        "side": 3,
+        "symbol": sym,
+        "type": 1,
+        "vol": _rfmt_vol(
+            sym,
+            min_vol
+        ),
+    }
+
+    test_price = float(
+        _rfmt_price(
+            sym,
+            limit_price
+        )
+    )
+
+    threshold_notional = (
+        min_vol
+        *
+        _contract_size(sym)
+        *
+        test_price
+    )
+
+    log.info(
+        f"[{sym}] MINIMUM test: "
+        f"vol={_rfmt_vol(sym, min_vol)} "
+        f"price={test_price:.10f} "
+        f"threshold_notional="
+        f"${threshold_notional:.10f}"
+    )
+
+    r = mexc(
+        "POST",
+        "/api/v1/private/order/create",
+        body=body
+    )
+
+    if not r.get("success"):
+
+        log.error(
+            f"[{sym}] minimum-threshold test "
+            f"order rejected: {r}"
+        )
+
+        return None
+
+    data = (
+        r.get("data")
+        or {}
+    )
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        log.error(
+            f"[{sym}] minimum-threshold test "
+            f"returned unexpected data shape: "
+            f"{data!r}"
+        )
+
+        return None
+
+    oid = data.get(
+        "orderId"
+    )
+
+    if not oid:
+
+        log.error(
+            f"[{sym}] minimum-threshold test "
+            f"succeeded but no orderId: "
+            f"{data!r}"
+        )
+
         return None
 
     oid = str(oid)
 
     log.info(
-        f"[{sym}] limit SHORT "
-        f"{_rfmt_vol(sym, vol)} "
-        f"@ {_rfmt_price(sym, limit_price)} "
-        f"id={oid} "
-        f"usd={usd_amount:.6f} "
-        f"sizing_price={sizing_price:.8f}"
+        f"[{sym}] MINIMUM test order placed "
+        f"successfully: id={oid} "
+        f"vol={_rfmt_vol(sym, min_vol)} "
+        f"@ {test_price:.10f} "
+        f"threshold_notional="
+        f"${threshold_notional:.10f}"
     )
 
     return oid
@@ -761,13 +1228,17 @@ def cancel_order(
     )
 
     if ok:
+
         log.info(
-            f"[{sym}] cancelled order id={oid}"
+            f"[{sym}] cancelled "
+            f"order id={oid}"
         )
+
     else:
+
         log.error(
-            f"[{sym}] cancel failed for "
-            f"id={oid}: {r}"
+            f"[{sym}] cancel failed "
+            f"for id={oid}: {r}"
         )
 
     return ok
@@ -778,45 +1249,18 @@ def is_filled(
     oid: str
 ) -> bool:
 
-    return oid not in _open_ids(sym)
-
-
-def get_mark(
-    sym: str
-) -> float:
-
-    d = (
-        mexc(
-            "GET",
-            "/api/v1/contract/ticker",
-            params={"symbol": sym}
-        ).get("data") or {}
-    )
-
-    return float(
-        d.get(
-            "fairPrice",
-            d.get(
-                "lastPrice",
-                0
-            )
-        ) or 0
+    return (
+        oid not in
+        _open_ids(sym)
     )
 
 
-# ── daily klines / rolling 9-day high ────────────────────────────────────────
+# ── daily klines / rolling high ──────────────────────────────────────────────
 
 def fetch_daily_bars(
     sym: str,
     lookback_days: int
 ) -> List[Dict]:
-
-    """
-    Fetch closed daily candles.
-
-    Uses realHigh where available.
-    Excludes the currently open daily candle.
-    """
 
     now_s = int(
         time.time()
@@ -824,35 +1268,49 @@ def fetch_daily_bars(
 
     start_s = (
         now_s -
-        (lookback_days + 2) * 86400
+        (lookback_days + 2)
+        * 86400
     )
 
     url = (
-        f"{MEXC_BASE}/api/v1/contract/kline/{sym}"
+        f"{MEXC_BASE}/api/v1/contract/kline/"
+        f"{sym}"
         f"?interval=Day1"
         f"&start={start_s}"
         f"&end={now_s}"
     )
 
     try:
+
         raw = _get(url)
 
     except Exception as e:
+
         log.error(
-            f"[{sym}] daily kline fetch failed: {e}"
+            f"[{sym}] daily kline "
+            f"fetch failed: {e}"
         )
+
         return []
 
     if not raw.get("success"):
+
         log.error(
-            f"[{sym}] daily kline fetch unsuccessful: "
-            f"{raw}"
+            f"[{sym}] daily kline "
+            f"fetch unsuccessful: {raw}"
         )
+
         return []
 
-    d = raw.get("data") or {}
+    d = (
+        raw.get("data")
+        or {}
+    )
 
-    times = d.get("time") or []
+    times = (
+        d.get("time")
+        or []
+    )
 
     highs = (
         d.get("realHigh")
@@ -865,16 +1323,25 @@ def fetch_daily_bars(
     for i in range(
         len(times)
     ):
+
+        if i >= len(highs):
+            break
+
         t_s = int(
             times[i]
         )
 
-        if t_s + 86400 > now_s:
+        if (
+            t_s + 86400
+            > now_s
+        ):
             continue
 
         bars.append({
             "t": t_s * 1000,
-            "h": float(highs[i])
+            "h": float(
+                highs[i]
+            ),
         })
 
     bars.sort(
@@ -894,11 +1361,15 @@ def rolling_9d_high(
     )
 
     if len(bars) < ROLL_DAYS:
+
         log.error(
-            f"[{sym}] only {len(bars)} closed "
-            f"daily bars available, need {ROLL_DAYS} "
-            f"— cannot compute 9d high"
+            f"[{sym}] only "
+            f"{len(bars)} closed daily "
+            f"bars available, need "
+            f"{ROLL_DAYS} — cannot "
+            f"compute 9d high"
         )
+
         return None
 
     window = bars[
@@ -911,14 +1382,15 @@ def rolling_9d_high(
     )
 
 
-# ── startup test orders ──────────────────────────────────────────────────────
+# ── startup minimum-order tests ──────────────────────────────────────────────
 
 def run_startup_test_order_for(
     sym: str
 ):
 
     log.info(
-        f"── startup test order [{sym}]: begin ──────────────────"
+        f"── startup MINIMUM test "
+        f"[{sym}]: begin ───────────────"
     )
 
     try:
@@ -926,10 +1398,13 @@ def run_startup_test_order_for(
         mark = get_mark(sym)
 
         if mark <= 0:
+
             log.error(
-                f"[{sym}] test order aborted: "
-                f"invalid mark price ({mark})"
+                f"[{sym}] test aborted: "
+                f"invalid mark price "
+                f"({mark})"
             )
+
             return
 
         test_price = (
@@ -937,53 +1412,72 @@ def run_startup_test_order_for(
             TEST_ORDER_PREMIUM
         )
 
-        log.info(
-            f"[{sym}] test order: "
-            f"mark={mark:.8f} "
-            f"limit={test_price:.8f} "
-            f"(+{(TEST_ORDER_PREMIUM - 1) * 100:.0f}%) "
-            f"usd={TEST_ORDER_USD:.2f}"
-        )
-
-        oid = place_short(
-            sym,
-            test_price,
-            mark,
-            TEST_ORDER_USD
-        )
-
-        if oid == "SKIP":
-            log.warning(
-                f"[{sym}] test order skipped — "
-                f"below minimum contract size"
+        rounded_test_price = float(
+            _rfmt_price(
+                sym,
+                test_price
             )
-            return
+        )
+
+        min_vol = _min_contracts(
+            sym
+        )
+
+        threshold_notional = (
+            min_vol
+            *
+            _contract_size(sym)
+            *
+            rounded_test_price
+        )
+
+        log.info(
+            f"[{sym}] minimum test: "
+            f"mark={mark:.10f} "
+            f"limit={rounded_test_price:.10f} "
+            f"+10% "
+            f"minimum_vol="
+            f"{_rfmt_vol(sym, min_vol)} "
+            f"threshold="
+            f"${threshold_notional:.10f}"
+        )
+
+        oid = place_minimum_test_short(
+            sym,
+            rounded_test_price
+        )
 
         if oid is None:
+
             log.error(
-                f"[{sym}] test order was rejected "
-                f"by MEXC"
+                f"[{sym}] minimum-threshold "
+                f"test FAILED"
             )
+
             return
 
         log.info(
-            f"[{sym}] test order placed "
-            f"id={oid} — waiting "
-            f"{TEST_ORDER_WAIT_SEC}s"
+            f"[{sym}] minimum-threshold "
+            f"test order placed id={oid}; "
+            f"waiting {TEST_ORDER_WAIT_SEC}s"
         )
 
         time.sleep(
             TEST_ORDER_WAIT_SEC
         )
 
-        if is_filled(sym, oid):
+        if is_filled(
+            sym,
+            oid
+        ):
 
             log.warning(
-                f"[{sym}] test order id={oid} "
-                f"FILLED during the "
-                f"{TEST_ORDER_WAIT_SEC}s wait — "
-                f"this is now a real open short "
-                f"position. Review MEXC manually."
+                f"[{sym}] minimum test order "
+                f"id={oid} FILLED during "
+                f"the {TEST_ORDER_WAIT_SEC}s "
+                f"wait — this is now a real "
+                f"open short position. "
+                f"Review MEXC manually."
             )
 
         else:
@@ -994,50 +1488,82 @@ def run_startup_test_order_for(
             )
 
             if cancelled:
+
                 log.info(
-                    f"[{sym}] test order id={oid} "
-                    f"cancelled successfully"
+                    f"[{sym}] minimum-threshold "
+                    f"test PASSED: order placed "
+                    f"at exact minimum volume "
+                    f"and cancelled successfully"
                 )
+
             else:
+
                 log.error(
-                    f"[{sym}] test order id={oid} "
-                    f"could not be cancelled — "
-                    f"check MEXC manually"
+                    f"[{sym}] minimum-threshold "
+                    f"test order could not be "
+                    f"cancelled — check MEXC"
                 )
 
     except Exception as e:
 
         log.error(
-            f"[{sym}] startup test order failed: {e}",
+            f"[{sym}] startup minimum test "
+            f"failed: {e}",
             exc_info=True
         )
 
     log.info(
-        f"── startup test order [{sym}]: end ─────────────────────"
+        f"── startup MINIMUM test "
+        f"[{sym}]: end ─────────────────"
     )
 
 
 def run_startup_test_orders():
 
     log.info(
-        f"══ startup test orders: "
+        f"══ startup minimum-order tests: "
         f"{len(SYMBOLS)} symbols, "
         f"~{TEST_ORDER_WAIT_SEC}s each ══"
     )
 
     for sym in SYMBOLS:
-        run_startup_test_order_for(sym)
+
+        run_startup_test_order_for(
+            sym
+        )
 
     log.info(
-        "══ startup test orders: all symbols done ══"
+        "══ startup minimum-order tests: "
+        "all symbols done ══"
     )
 
 
-# ── daily DCA trigger ────────────────────────────────────────────────────────
+# ── daily DCA engine ─────────────────────────────────────────────────────────
 
 def run_daily_dca(
     now_utc: datetime.datetime
 ):
+
+    """
+    Add today's DCA allocation to each symbol's persistent accumulator.
+
+    The accumulator is only converted into an order once it is above
+    the symbol's current minimum executable notional.
+
+    Example:
+
+        daily allocation = $1.3889
+        minimum notional = $10
+
+        Day 1:  accrued $1.3889 -> no order
+        Day 2:  accrued $2.7778 -> no order
+        ...
+        Day 8:  accrued $11.1112 -> order
+                accumulator resets to $0
+
+    If order placement fails, the accumulator is NOT reset, so the
+    accumulated amount remains available for the next midnight retry.
+    """
 
     today = now_utc.date()
 
@@ -1055,65 +1581,170 @@ def run_daily_dca(
         ):
             log.info(
                 f"[{sym}] DCA: already fired "
-                f"for {today.isoformat()} — skipping"
+                f"for {today.isoformat()} "
+                f"— skipping"
             )
             continue
 
-        mark = get_mark(sym)
-
-        if mark <= 0:
-            log.error(
-                f"[{sym}] DCA: invalid mark price "
-                f"({mark}) — skipping today"
-            )
-            continue
-
-        target = rolling_9d_high(sym)
-
-        if target is None:
-            log.error(
-                f"[{sym}] DCA: could not compute "
-                f"9d high — skipping today"
-            )
-            continue
-
-        daily_usd = DCA_DAILY_USD[sym]
-
-        total_budget = DCA_BUDGET_USD[sym]
-
-        log.info(
-            f"[{sym}] DCA fire "
-            f"{today.isoformat()}: "
-            f"daily=${daily_usd:.8f} "
-            f"budget=${total_budget:.8f} "
-            f"limit SHORT @ 9dHigh={target:.8f} "
-            f"(sized off 9dHigh, "
-            f"not mark={mark:.8f})"
+        target = rolling_9d_high(
+            sym
         )
 
+        if target is None:
+
+            log.error(
+                f"[{sym}] DCA: could not "
+                f"compute 9d high — "
+                f"today's allocation is "
+                f"NOT accrued; retrying "
+                f"next midnight"
+            )
+
+            continue
+
+        mark = get_mark(
+            sym
+        )
+
+        if mark <= 0:
+
+            log.error(
+                f"[{sym}] DCA: invalid "
+                f"mark price ({mark}) — "
+                f"today's allocation is "
+                f"NOT accrued"
+            )
+
+            continue
+
+        daily_usd = (
+            DCA_DAILY_USD[sym]
+        )
+
+        previous_accrued = (
+            get_accrued(sym)
+        )
+
+        accrued = (
+            previous_accrued
+            +
+            daily_usd
+        )
+
+        set_accrued(
+            sym,
+            accrued
+        )
+
+        min_vol = _min_contracts(
+            sym
+        )
+
+        min_notional = (
+            min_vol
+            *
+            _contract_size(sym)
+            *
+            target
+        )
+
+        log.info(
+            f"[{sym}] DCA allocation: "
+            f"daily=${daily_usd:.8f} "
+            f"previous_accrued="
+            f"${previous_accrued:.8f} "
+            f"new_accrued="
+            f"${accrued:.8f} "
+            f"minimum_at_9dHigh="
+            f"${min_notional:.8f} "
+            f"target={target:.8f} "
+            f"mark={mark:.8f}"
+        )
+
+        # "exceeds" the minimum rather than merely equals it.
+        if accrued <= min_notional:
+
+            log.info(
+                f"[{sym}] DCA: accumulated "
+                f"${accrued:.8f} is not above "
+                f"minimum ${min_notional:.8f}; "
+                f"no order today"
+            )
+
+            save_state(
+                STATE_DATA
+            )
+
+            continue
+
+        # The entire accumulated amount is placed.
+        #
+        # Sizing uses target itself, because the order is priced at
+        # target and the intended notional is the accumulated amount.
         oid = place_short(
             sym,
             target,
             target,
-            daily_usd
+            accrued
         )
 
         if oid == "SKIP":
+
             log.warning(
-                f"[{sym}] DCA fire skipped — "
-                f"below minimum contract size; "
-                f"NOT marked as fired"
+                f"[{sym}] DCA: accumulated "
+                f"${accrued:.8f} still produced "
+                f"a below-minimum contract "
+                f"volume after rounding; "
+                f"keeping accumulator intact"
             )
+
+            save_state(
+                STATE_DATA
+            )
+
             continue
 
         if oid is None:
+
             log.error(
-                f"[{sym}] DCA fire rejected by MEXC; "
-                f"NOT marked as fired"
+                f"[{sym}] DCA: order rejected; "
+                f"keeping accumulated "
+                f"${accrued:.8f} for retry"
             )
+
+            save_state(
+                STATE_DATA
+            )
+
             continue
 
-        mark_fired(
+        actual_volume = _contracts(
+            sym,
+            accrued,
+            target
+        )
+
+        actual_notional = (
+            actual_volume
+            *
+            _contract_size(sym)
+            *
+            target
+        )
+
+        log.info(
+            f"[{sym}] DCA FIRE: "
+            f"date={today.isoformat()} "
+            f"accumulated=${accrued:.8f} "
+            f"actual_order_notional="
+            f"${actual_notional:.8f} "
+            f"min_notional="
+            f"${min_notional:.8f} "
+            f"9dHigh={target:.8f} "
+            f"order_id={oid}"
+        )
+
+        record_successful_dca(
             sym,
             today,
             {
@@ -1123,13 +1754,20 @@ def run_daily_dca(
                 "limit_price": target,
                 "sizing_price": target,
                 "mark_at_fire": mark,
-                "usd": daily_usd,
-                "symbol_total_budget": total_budget,
+                "usd": accrued,
+                "actual_order_notional": actual_notional,
+                "minimum_notional_at_fire": min_notional,
+                "daily_allocation": daily_usd,
+                "symbol_total_budget": DCA_BUDGET_USD[sym],
+                "accumulated_days_in_order": round(
+                    accrued / daily_usd,
+                    8
+                ),
             }
         )
 
 
-# ── SVG status table ─────────────────────────────────────────────────────────
+# ── SVG status ───────────────────────────────────────────────────────────────
 
 def render_svg(
     marks: Dict[str, float],
@@ -1137,26 +1775,36 @@ def render_svg(
     today: datetime.date
 ) -> str:
 
-    W = 1180
-    H = 60 + 26 * len(SYMBOLS)
+    W = 1400
+
+    H = (
+        70 +
+        30 * len(SYMBOLS)
+    )
 
     now_str = (
         datetime.datetime.now(UTC)
-        .strftime("%Y-%m-%d %H:%M UTC")
+        .strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
     )
 
     svg = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
+
+        '<?xml version="1.0" '
+        'encoding="UTF-8"?>',
 
         (
             f'<svg xmlns="http://www.w3.org/2000/svg" '
             f'viewBox="0 0 {W} {H}" '
             f'width="100%" '
-            f'style="max-width:{W}px;display:block">'
+            f'style="max-width:{W}px;'
+            f'display:block">'
         ),
 
         (
-            f'<rect width="{W}" height="{H}" '
+            f'<rect width="{W}" '
+            f'height="{H}" '
             f'fill="#fafafa"/>'
         ),
 
@@ -1167,12 +1815,23 @@ def render_svg(
             f'fill="#333" '
             f'font-weight="bold">'
             f'DCA5-Bot — 90-Day DCA Short '
-            f'(priced + sized at 9d high)  '
+            f'(9d high pricing/sizing) '
             f'{now_str}</text>'
+        ),
+
+        (
+            f'<text x="20" y="45" '
+            f'font-family="Courier New" '
+            f'font-size="10" '
+            f'fill="#555">'
+            f'Original symbols: $1,000 each | '
+            f'New-stock pool: $1,000 total | '
+            f'Orders fire only when accrued '
+            f'amount exceeds minimum</text>'
         ),
     ]
 
-    y = 50
+    y = 70
 
     for sym in SYMBOLS:
 
@@ -1181,7 +1840,9 @@ def render_svg(
             0.0
         )
 
-        high = highs.get(sym)
+        high = highs.get(
+            sym
+        )
 
         high_str = (
             f"{high:,.4f}"
@@ -1189,7 +1850,9 @@ def render_svg(
             else "n/a"
         )
 
-        start = DCA_START_DATE[sym]
+        start = DCA_START_DATE[
+            sym
+        ]
 
         end = (
             start +
@@ -1198,7 +1861,9 @@ def render_svg(
             )
         )
 
-        n_fired = fired_count(sym)
+        n_fired = fired_count(
+            sym
+        )
 
         active = in_dca_window(
             sym,
@@ -1210,15 +1875,45 @@ def render_svg(
             today
         )
 
-        symbol_budget = DCA_BUDGET_USD[sym]
-
-        daily_budget = DCA_DAILY_USD[sym]
-
-        remaining_usd = max(
-            0.0,
-            symbol_budget -
-            n_fired * daily_budget
+        symbol_budget = (
+            DCA_BUDGET_USD[sym]
         )
+
+        daily_budget = (
+            DCA_DAILY_USD[sym]
+        )
+
+        accrued = get_accrued(
+            sym
+        )
+
+        min_notional = (
+            (
+                _min_contracts(sym)
+                *
+                _contract_size(sym)
+                *
+                high
+            )
+            if high is not None
+            else None
+        )
+
+        if min_notional is not None:
+
+            min_str = (
+                f"${min_notional:,.4f}"
+            )
+
+            ready = (
+                accrued >
+                min_notional
+            )
+
+        else:
+
+            min_str = "n/a"
+            ready = False
 
         if today < start:
 
@@ -1243,29 +1938,47 @@ def render_svg(
             )
 
             if fired_today:
-                phase += " — fired today"
 
-            elif active:
-                phase += " — pending today"
+                phase += (
+                    " — order fired"
+                )
 
-        clr = (
-            "#1a8a1a"
-            if fired_today
-            else (
-                "#aa1111"
-                if active
-                else "#888"
-            )
-        )
+            elif ready:
+
+                phase += (
+                    " — READY"
+                )
+
+            else:
+
+                phase += (
+                    " — accumulating"
+                )
+
+        if fired_today:
+
+            clr = "#1a8a1a"
+
+        elif ready:
+
+            clr = "#aa1111"
+
+        elif active:
+
+            clr = "#555"
+
+        else:
+
+            clr = "#888"
 
         line = (
             f"{sym:<18} "
             f"mark={mark:>12,.4f}  "
             f"9dHigh={high_str:>12}  "
-            f"daily=${daily_budget:>10.6f}  "
-            f"budget=${symbol_budget:>8.2f}  "
+            f"daily=${daily_budget:>9.5f}  "
+            f"accrued=${accrued:>10.5f}  "
+            f"min={min_str:>11}  "
             f"fired={n_fired:>3}/{DCA_DAYS}  "
-            f"remaining=${remaining_usd:>10.2f}  "
             f"{phase}"
         )
 
@@ -1276,11 +1989,15 @@ def render_svg(
             f'fill="{clr}">{line}</text>'
         )
 
-        y += 26
+        y += 30
 
-    svg.append("</svg>")
+    svg.append(
+        "</svg>"
+    )
 
-    return "\n".join(svg)
+    return "\n".join(
+        svg
+    )
 
 
 # ── engine loop ──────────────────────────────────────────────────────────────
@@ -1290,7 +2007,11 @@ def _seconds_until_next_hour() -> float:
     now = time.time()
 
     return (
-        (int(now) // 3600 + 1) * 3600
+        (
+            int(now) // 3600
+            + 1
+        )
+        * 3600
         + HOURLY_SLEEP_FLOOR_SEC
         - now
     )
@@ -1298,7 +2019,11 @@ def _seconds_until_next_hour() -> float:
 
 def engine_cycle():
 
-    now_utc = datetime.datetime.now(UTC)
+    now_utc = (
+        datetime.datetime.now(
+            UTC
+        )
+    )
 
     marks = {
         sym: get_mark(sym)
@@ -1311,7 +2036,17 @@ def engine_cycle():
     }
 
     if now_utc.hour == 0:
-        run_daily_dca(now_utc)
+
+        run_daily_dca(
+            now_utc
+        )
+
+        # Refresh high values after the DCA pass so the status page
+        # represents the same current cycle.
+        highs = {
+            sym: rolling_9d_high(sym)
+            for sym in SYMBOLS
+        }
 
     svg = render_svg(
         marks,
@@ -1319,17 +2054,27 @@ def engine_cycle():
         now_utc.date()
     )
 
-    STATE.set_svg(svg)
+    STATE.set_svg(
+        svg
+    )
 
     n_fired_total = sum(
         len(v)
-        for v in STATE_DATA["fired"].values()
+        for v in STATE_DATA[
+            "fired"
+        ].values()
+    )
+
+    total_accrued = sum(
+        get_accrued(sym)
+        for sym in SYMBOLS
     )
 
     STATE.set_status(
         f"ok  "
         f"{now_utc.strftime('%Y-%m-%d %H:%M UTC')}  "
-        f"total_fires={n_fired_total}"
+        f"total_fires={n_fired_total}  "
+        f"accrued=${total_accrued:.8f}"
     )
 
 
@@ -1340,10 +2085,12 @@ def run_engine():
     run_startup_test_orders()
 
     log.info(
-        "engine starting — running initial cycle"
+        "engine starting — "
+        "running initial cycle"
     )
 
     try:
+
         engine_cycle()
 
     except Exception as e:
@@ -1359,13 +2106,19 @@ def run_engine():
 
     while True:
 
-        wait_s = _seconds_until_next_hour()
+        wait_s = (
+            _seconds_until_next_hour()
+        )
 
         time.sleep(
-            max(0, wait_s)
+            max(
+                0,
+                wait_s
+            )
         )
 
         try:
+
             engine_cycle()
 
         except Exception as e:
@@ -1402,7 +2155,9 @@ class Handler(
                 .encode("utf-8")
             )
 
-            self.send_response(200)
+            self.send_response(
+                200
+            )
 
             self.send_header(
                 "Content-Type",
@@ -1421,16 +2176,22 @@ class Handler(
 
             self.end_headers()
 
-            self.wfile.write(svg)
+            self.wfile.write(
+                svg
+            )
 
         elif self.path == "/orders.json":
 
             body = json.dumps(
                 STATE_DATA["orders"],
                 indent=2
-            ).encode("utf-8")
+            ).encode(
+                "utf-8"
+            )
 
-            self.send_response(200)
+            self.send_response(
+                200
+            )
 
             self.send_header(
                 "Content-Type",
@@ -1444,33 +2205,40 @@ class Handler(
 
             self.end_headers()
 
-            self.wfile.write(body)
+            self.wfile.write(
+                body
+            )
 
         elif (
             self.path == "/"
             or self.path == ""
         ):
 
-            status = STATE.get_status()
+            status = (
+                STATE.get_status()
+            )
 
             html = (
                 "<!doctype html>"
                 "<html>"
                 "<head>"
                 "<meta charset='utf-8'>"
-                "<meta http-equiv='refresh' content='300'>"
+                "<meta http-equiv='refresh' "
+                "content='300'>"
                 "<title>DCA5-Bot Overview</title>"
                 "<style>"
                 "body{font-family:monospace;"
-                "background:#fafafa;margin:24px}"
-                "img{max-width:100%;height:auto;"
+                "background:#fafafa;"
+                "margin:24px}"
+                "img{max-width:100%;"
+                "height:auto;"
                 "border:1px solid #ccc}"
                 "</style>"
                 "</head>"
                 "<body>"
                 "<h3>"
                 "DCA5-Bot — 90-Day DCA Short Bot "
-                "(priced + sized at 9d high)"
+                "(9d-high pricing/sizing)"
                 "</h3>"
                 f"<p>status: {status}</p>"
                 "<img src='/chart.svg' "
@@ -1488,7 +2256,9 @@ class Handler(
                 "utf-8"
             )
 
-            self.send_response(200)
+            self.send_response(
+                200
+            )
 
             self.send_header(
                 "Content-Type",
@@ -1502,11 +2272,15 @@ class Handler(
 
             self.end_headers()
 
-            self.wfile.write(body)
+            self.wfile.write(
+                body
+            )
 
         else:
 
-            self.send_response(404)
+            self.send_response(
+                404
+            )
 
             self.end_headers()
 
@@ -1535,7 +2309,10 @@ def run_server():
 
 def main():
 
-    if not MEXC_KEY or not MEXC_SECRET:
+    if (
+        not MEXC_KEY
+        or not MEXC_SECRET
+    ):
 
         log.error(
             "MEXC / MEXCSECRET not set"
@@ -1544,29 +2321,59 @@ def main():
         raise SystemExit(1)
 
     log.info(
-        "DCA budget configuration:"
+        "════════ DCA BUDGET CONFIGURATION ════════"
     )
 
     for sym in SYMBOLS:
+
         log.info(
-            f"  {sym}: "
+            f"{sym}: "
             f"total=${DCA_BUDGET_USD[sym]:.8f} "
             f"daily=${DCA_DAILY_USD[sym]:.8f}"
         )
 
+    original_total = sum(
+        DCA_BUDGET_USD[sym]
+        for sym in ORIGINAL_SYMBOLS
+    )
+
+    new_stock_total = sum(
+        DCA_BUDGET_USD[sym]
+        for sym in NEW_STOCK_SYMBOLS
+    )
+
+    grand_total = sum(
+        DCA_BUDGET_USD.values()
+    )
+
     log.info(
         f"Original-symbol combined budget: "
-        f"${sum(DCA_BUDGET_USD[s] for s in ORIGINAL_SYMBOLS):.2f}"
+        f"${original_total:.2f}"
     )
 
     log.info(
         f"New-stock combined budget: "
-        f"${sum(DCA_BUDGET_USD[s] for s in NEW_STOCK_SYMBOLS):.2f}"
+        f"${new_stock_total:.2f}"
     )
 
     log.info(
         f"Grand configured DCA budget: "
-        f"${sum(DCA_BUDGET_USD.values()):.2f}"
+        f"${grand_total:.2f}"
+    )
+
+    log.info(
+        "DCA orders accumulate daily until "
+        "their current 9d-high notional is "
+        "strictly above the symbol minimum."
+    )
+
+    log.info(
+        "Startup tests use EXACTLY each "
+        "symbol's minimum contract volume."
+    )
+
+    log.info(
+        "══════════════════════════════════════════"
     )
 
     server_thread = threading.Thread(
