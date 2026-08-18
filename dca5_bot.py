@@ -193,7 +193,7 @@ MEXC_BASE = "https://api.mexc.co"
 # Symbols in this DCA program. The startup test order validates EVERY one.
 SYMBOLS = [
     "SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT",
-    "NAS100_USDT", "COPPER_USDT", "SILVER_USDT", "XAU_USDT",
+    "NAS100_USDT", "SILVER_USDT", "XAU_USDT",
 ]
 
 # Default leverage requested for every symbol UNLESS the exchange's own
