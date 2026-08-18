@@ -194,9 +194,6 @@ MEXC_BASE = "https://api.mexc.co"
 SYMBOLS = [
     "SPX500_USDT", "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT",
     "NAS100_USDT", "COPPER_USDT", "SILVER_USDT", "XAU_USDT",
-    "BABASTOCK_USDT", "BIDUSTOCK_USDT", "JDSTOCK_USDT", "XIAOMISTOCK_USDT",
-    "ZHONGJISTOCK_USDT", "ZHIPUSTOCK_USDT", "ENFLAMESTOCK_USDT",
-    "CXMTSTOCK_USDT",
 ]
 
 # Default leverage requested for every symbol UNLESS the exchange's own
@@ -784,8 +781,8 @@ def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">',
-        f'<rect width="{W}" height="{H}" fill="#0b0b0b"/>',
-        f'<text x="10" y="20" fill="#eee" font-family="monospace" font-size="14">'
+        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
+        f'<text x="10" y="20" fill="#111" font-family="monospace" font-size="14">'
         f'DCA5-Bot (priced + sized at 9d high) {now_str}</text>',
     ]
     y = 50
@@ -812,7 +809,7 @@ def render_svg(marks: Dict[str, float], highs: Dict[str, Optional[float]], today
                 " — queued today" if fired_today else " — pending today" if active else ""
             )
 
-        clr = "#1a8a1a" if fired_today else ("#aa1111" if active else "#888")
+        clr = "#1a8a1a" if fired_today else ("#aa1111" if active else "#999")
         line = (f"{sym:<18} mark={mark:>12,.4f} 9dHigh={high_str:>12} "
                 f"queued={n_fired:>3}/{DCA_DAYS} pending=${pending:>7,.2f} "
                 f"lev={lev:>3}x remaining=${remaining_usd:>8,.2f} {phase}")
