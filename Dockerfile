@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application source.
-COPY dca5_bot.py .
+COPY transfag-bot.py .
 
 # Informational only — Fly.io injects the actual PORT environment variable
 # at runtime and routes to it based on the internal_port setting below.
@@ -29,4 +29,4 @@ RUN mkdir -p /data && \
 
 USER appuser
 
-CMD ["python", "dca5_bot.py"]
+CMD ["python", "transfag-bot.py"]
