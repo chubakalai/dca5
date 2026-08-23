@@ -4,18 +4,22 @@ MultiBiDCA-Bot — Multi-Symbol Bidirectional Daily DCA Bot.
 
 Every symbol is priced and sized independently. Once per UTC day,
 at UTC midnight, the bot fires exactly one limit order per symbol,
-at that moment's mark price, sized at the exchange's own minimum
-order size for that contract. Direction is fixed per symbol by a
-static classification supplied at the top of this file:
+at that moment's mark price, sized at the GREATER of:
+  - a fixed USD floor (ORDER_MIN_USD, currently $0.10), and
+  - the exchange's own reported minimum order size for that
+    contract (volUnit, converted to USD at the current mark price).
+
+Direction is fixed per symbol by a static classification supplied
+at the top of this file:
 
   - "up"   list -> SELL (short) once per day
   - "down" list -> BUY  (long)  once per day
 
 This is intentionally a bidirectional, stacking DCA protocol: there
 is no budget, no accumulator, and no automatic close. Each day's
-minimum-size order simply adds to (or against) that symbol's
-existing isolated position. Positions are expected to accumulate
-over time; unwinding them is a manual, out-of-band decision.
+order simply adds to (or against) that symbol's existing isolated
+position. Positions are expected to accumulate over time; unwinding
+them is a manual, out-of-band decision.
 
 Single-process, single-machine bot for Fly.io.
 
@@ -24,18 +28,38 @@ the top of this file. Each base is resolved to BASE + "_USDT" and
 validated live against MEXC's contract detail at startup.
 
 ═══════════════════════════════════════════════════════════════════
+ORDER SIZING
+═══════════════════════════════════════════════════════════════════
+
+For every order this bot places (startup test orders AND daily
+fires alike):
+
+  1. Compute the exchange's own minimum order size in USD:
+       exch_min_usd = volUnit * contractSize * price
+  2. target_usd = max(ORDER_MIN_USD, exch_min_usd)
+  3. Convert target_usd to contracts at `price`, rounded to the
+     exchange's volume precision.
+  4. If the ROUNDED contract count still falls below volUnit (can
+     happen after rounding down, e.g. for high-priced/low-precision
+     contracts), bump up to exactly volUnit contracts, since MEXC
+     will otherwise reject the order outright.
+
+This sizing function (`_target_vol`) is the single place order size
+is decided; both startup test orders and daily fires call it, so
+sizing logic can never drift between the two.
+
+═══════════════════════════════════════════════════════════════════
 DAILY EXECUTION ENGINE
 ═══════════════════════════════════════════════════════════════════
 
 Once per UTC calendar day, at or after UTC midnight (00:00:00), for
 EVERY non-failed symbol:
   1. Fetch the current mark price.
-  2. Place ONE limit order at exactly that mark price:
+  2. Compute order size per ORDER SIZING above.
+  3. Place ONE limit order at exactly that mark price:
        - side = SELL if the symbol's base is in UP_BASES
        - side = BUY  if the symbol's base is in DOWN_BASES
-     sized at the exchange-reported minimum order size (never more,
-     never less, never accumulated).
-  3. Record the fill attempt (success or failure) for charting and
+  4. Record the fill attempt (success or failure) for charting and
      for the 14:00 UTC report.
 
 A guard (mirroring the original bot's report guard) ensures the
@@ -45,11 +69,7 @@ least DAILY_FIRE_MIN_INTERVAL_HOURS have passed since the last
 successful daily-fire pass for that symbol.
 
 FAILED symbols (see below) are skipped entirely at fire time — no
-order is ever attempted for them — but the "missed" attempt is not
-recorded, since failed symbols never reach the fire step at all
-(they are excluded up front, same as the original bot's trading
-exclusion, not its per-minute trigger-marking, since this protocol
-has no per-minute triggers).
+order is ever attempted for them.
 
 ═══════════════════════════════════════════════════════════════════
 FAILED SYMBOLS
@@ -76,8 +96,8 @@ the trailing 30 UTC-daily candles. The chart marks:
   - Every REAL daily order successfully placed, as a filled circle
     (blue = buy, red = sell) at its fire time/price.
   - Every MISSED/FAILED daily attempt (order rejected by the
-    exchange, or size below minimum, for a non-failed symbol) as a
-    small X tick marker at the attempted time/price.
+    exchange, for a non-failed symbol) as a small X tick marker at
+    the attempted time/price.
 
 Charts are re-rendered every 30 minutes, independent of the daily
 fire cycle, using the daily-candle buffer (which is itself also
@@ -100,29 +120,24 @@ line per symbol, containing:
     unrealized-PnL field is used directly where available)
 
 This bot never closes positions automatically, so PnL reported here
-is ALWAYS unrealized / mark-to-market — there is no realized PnL to
-report, since nothing is ever sold back / bought back by the bot
-itself.
+is ALWAYS unrealized / mark-to-market.
 
 The same duplicate-send guard as the original bot applies: requires
 both (a) current time at/after 14:00 UTC, AND (b) at least
 REPORT_MIN_INTERVAL_HOURS since the last successful send.
 
-Failed symbols are still listed in the report (position size and
-PnL will reflect whatever was accumulated before failure, or zero
-if the symbol never traded) so the report reflects that they're
-being watched but not traded further.
+Failed symbols are still listed in the report so the report
+reflects that they're being watched but not traded further.
 
 ═══════════════════════════════════════════════════════════════════
 STARTUP TEST ORDERS
 ═══════════════════════════════════════════════════════════════════
 
-  - On startup: run a one-time TEST order (limit, sized at that
-    symbol's own exchange-reported minimum order size, in the
-    symbol's OWN daily direction — sell for up-list, buy for
-    down-list — at a price offset from mark so it does not
-    immediately fill) against EVERY symbol, in three flat batch
-    phases (no threads):
+  - On startup: run a one-time TEST order (limit, sized per ORDER
+    SIZING above, in the symbol's OWN daily direction — sell for
+    up-list, buy for down-list — at a price offset from mark so it
+    does not immediately fill) against EVERY symbol, in three flat
+    batch phases (no threads):
       1. OPEN  — send a test limit order for every symbol.
       2. WAIT  — sleep once, for TEST_ORDER_WAIT_SEC seconds.
       3. CLOSE — check fill status and cancel/confirm for every
@@ -233,6 +248,15 @@ OPEN_TYPE_ISOLATED = 1
 #   1 = open long, 2 = close short, 3 = open short, 4 = close long
 MEXC_SIDE_OPEN_LONG  = 1
 MEXC_SIDE_OPEN_SHORT = 3
+
+
+# ── order sizing constants ────────────────────────────────────────────────────
+
+# Fixed USD floor for every order this bot places (startup test
+# orders and daily fires alike). The exchange's own minimum order
+# size (volUnit, converted to USD at the order price) is always
+# also respected — the bot uses whichever of the two is larger.
+ORDER_MIN_USD = 0.10
 
 
 # ── daily fire engine constants ───────────────────────────────────────────────
@@ -935,6 +959,8 @@ def _contract_size(sym) -> float:
 
 def _mos(sym) -> float:
 
+    """Exchange-reported minimum order size, in contracts."""
+
     return specs.get(
         sym,
         {}
@@ -944,6 +970,48 @@ def _mos(sym) -> float:
 def _usd_of_contracts(sym, contracts: float, price: float) -> float:
 
     return contracts * _contract_size(sym) * price
+
+
+def _target_vol(sym: str, price: float) -> float:
+
+    """
+    Single source of truth for order sizing, used by BOTH startup
+    test orders and daily fires.
+
+    Sizing rule: max(ORDER_MIN_USD, exchange minimum order value in
+    USD), converted to contracts at `price`, rounded to the
+    exchange's volume precision, then bumped up to the exchange's
+    raw volUnit if rounding dropped it back below that floor (which
+    can happen for low-precision / high-priced contracts).
+    """
+
+    min_vol = _mos(sym)
+
+    exch_min_usd = _usd_of_contracts(sym, min_vol, price)
+
+    target_usd = max(ORDER_MIN_USD, exch_min_usd)
+
+    raw_contracts = (
+        target_usd / (_contract_size(sym) * price)
+        if price > 0
+        else min_vol
+    )
+
+    rounded_str = _rfmt_vol(sym, raw_contracts)
+
+    rounded_contracts = float(rounded_str)
+
+    if rounded_contracts < min_vol:
+
+        log.warning(
+            f"[{sym}] target size {rounded_contracts} contracts "
+            f"(${target_usd:.4f}) rounded below exchange minimum "
+            f"{min_vol} contracts — bumping up to exchange minimum"
+        )
+
+        rounded_contracts = min_vol
+
+    return rounded_contracts
 
 
 # ── open orders ───────────────────────────────────────────────────────────────
@@ -1234,9 +1302,8 @@ def fetch_daily_bars(
 
         t_s = int(times[i])
 
-        if t_s + 86400 > now_s + 86400:
-            # allow the in-progress (still-open) daily candle through;
-            # only drop bars that would represent the future
+        if t_s > now_s + 86400:
+            # drop bars that would represent the future
             continue
 
         try:
@@ -1418,11 +1485,12 @@ def process_symbol_daily_fire(sym: str, now_utc: datetime.datetime):
 
         return
 
-    vol = _mos(sym)
+    vol = _target_vol(sym, mark)
 
     log.info(
         f"[{sym}] daily fire due — side={side} "
-        f"mark={mark:.6f} vol={vol} (exchange minimum)"
+        f"mark={mark:.6f} vol={vol} "
+        f"(target ${_usd_of_contracts(sym, vol, mark):.4f})"
     )
 
     oid = place_order(sym, side, mark, vol)
@@ -1642,20 +1710,21 @@ def _open_test_order(sym: str) -> Optional[Dict]:
             else mark * TEST_ORDER_PREMIUM_SELL
         )
 
-        min_vol = _mos(sym)
+        vol = _target_vol(sym, test_price)
 
         log.info(
             f"[{sym}] test order OPEN: "
             f"side={side} mark={mark:.6f} "
             f"limit={test_price:.6f} "
-            f"vol={min_vol} (exchange minimum)"
+            f"vol={vol} (target "
+            f"${_usd_of_contracts(sym, vol, test_price):.4f})"
         )
 
         oid = place_order(
             sym,
             side,
             test_price,
-            min_vol
+            vol
         )
 
         if oid is None:
@@ -1676,7 +1745,7 @@ def _open_test_order(sym: str) -> Optional[Dict]:
             "oid": oid,
             "side": side,
             "limit_price": test_price,
-            "vol": min_vol,
+            "vol": vol,
         }
 
     except Exception as e:
