@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+abcdefg#!/usr/bin/env python3
 """
 MultiBiDCA-Bot — Multi-Symbol Bidirectional Daily DCA Bot.
 
